@@ -1,0 +1,7 @@
+torch
+rdkit
+PyTDC
+numpy
+matplotlib
+mlflow
+ipykernel
