@@ -1,9 +1,10 @@
 *.pth
 *.csv
 __pycache__/
+.pytest_cache/
 .ipynb_checkpoints/
 mlruns/
 mlflow.db
 runs/
 .claude/
-mlflow.db
+.DS_Store

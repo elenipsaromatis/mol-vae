@@ -8,3 +8,4 @@ ipykernel
 optuna
 optuna-integration
 scikit-learn
+pytest
