@@ -5,3 +5,6 @@ numpy
 matplotlib
 mlflow
 ipykernel
+optuna
+optuna-integration
+scikit-learn
