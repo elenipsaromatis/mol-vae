@@ -42,18 +42,16 @@ class Decoder(nn.Module):
         self.n_layers = n_layers
         self.hidden_dim = hidden_dim
         self.fc_z = nn.Linear(latent_dim, hidden_dim * n_layers)
-        self.gru = nn.GRU(vocab_size + latent_dim, hidden_dim, n_layers, batch_first=True)
+        self.gru = nn.GRU(vocab_size, hidden_dim, n_layers, batch_first=True)  # changed
         self.fc_out = nn.Linear(hidden_dim, vocab_size)
 
     def forward(self, z, x):
         hidden = self.fc_z(z)
         hidden = hidden.view(-1, self.n_layers, self.hidden_dim).permute(1, 0, 2).contiguous()
-        seq_len = x.size(1) - 1
         x_onehot = F.one_hot(x[:, :-1], num_classes=self.vocab_size).float()
-        z_repeated = z.unsqueeze(1).expand(-1, seq_len, -1)
-        gru_input = torch.cat([x_onehot, z_repeated], dim=-1)
-        output, _ = self.gru(gru_input, hidden)
-        return self.fc_out(output)
+        output, _ = self.gru(x_onehot, hidden)  # changed
+        logits = self.fc_out(output)
+        return logits
 
 
 class PropertyPredictor(nn.Module):
