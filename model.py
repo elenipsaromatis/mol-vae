@@ -42,14 +42,14 @@ class Decoder(nn.Module):
         self.n_layers = n_layers
         self.hidden_dim = hidden_dim
         self.fc_z = nn.Linear(latent_dim, hidden_dim * n_layers)
-        self.gru = nn.GRU(vocab_size, hidden_dim, n_layers, batch_first=True)  # changed
+        self.gru = nn.GRU(vocab_size, hidden_dim, n_layers, batch_first=True)
         self.fc_out = nn.Linear(hidden_dim, vocab_size)
 
     def forward(self, z, x):
         hidden = self.fc_z(z)
         hidden = hidden.view(-1, self.n_layers, self.hidden_dim).permute(1, 0, 2).contiguous()
         x_onehot = F.one_hot(x[:, :-1], num_classes=self.vocab_size).float()
-        output, _ = self.gru(x_onehot, hidden)  # changed
+        output, _ = self.gru(x_onehot, hidden)
         logits = self.fc_out(output)
         return logits
 
@@ -69,15 +69,16 @@ class PropertyPredictor(nn.Module):
 
 
 class VAE(nn.Module):
-    def __init__(self, vocab_size, seq_len, hidden_dim, latent_dim, n_layers):
+    def __init__(self, vocab_size, seq_len, hidden_dim, latent_dim, n_layers,
+                 dropout=0.5, prop_hidden_size=64):
         super().__init__()
         self.encoder = Encoder(vocab_size, seq_len, hidden_dim, latent_dim)
         self.decoder = Decoder(vocab_size, hidden_dim, latent_dim, n_layers)
-        self.predictor = PropertyPredictor(latent_dim)
+        self.predictor = PropertyPredictor(latent_dim, hidden_size=prop_hidden_size, dropout=dropout)
 
     def forward(self, x):
         mu, log_var = self.encoder(x)
         z = reparameterise(mu, log_var)
         logits = self.decoder(z, x)
-        prop_logit = self.predictor(mu)
+        prop_logit = self.predictor(z)
         return logits, mu, log_var, prop_logit

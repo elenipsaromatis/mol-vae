@@ -42,4 +42,8 @@ def evaluate_loss(model, loader, beta, gamma, device, kl_free_bits, train_labels
             total_kl += kl.item()
             total_prop += prop.item()
             n += 1
-    return total_recon / n, total_kl / n, total_prop / n
+    avg_recon = total_recon / n
+    avg_kl = total_kl / n
+    avg_prop = total_prop / n
+    avg_total = avg_recon + beta * avg_kl + gamma * avg_prop
+    return avg_recon, avg_kl, avg_prop, avg_total
