@@ -42,30 +42,35 @@ class Decoder(nn.Module):
         self.n_layers = n_layers
         self.hidden_dim = hidden_dim
         self.fc_z = nn.Linear(latent_dim, hidden_dim * n_layers)
-        self.gru = nn.GRU(vocab_size, hidden_dim, n_layers, batch_first=True)
+        self.gru = nn.GRU(vocab_size + latent_dim, hidden_dim, n_layers, batch_first=True)
         self.fc_out = nn.Linear(hidden_dim, vocab_size)
 
     def forward(self, z, x):
         hidden = self.fc_z(z)
         hidden = hidden.view(-1, self.n_layers, self.hidden_dim).permute(1, 0, 2).contiguous()
+        seq_len = x.size(1) - 1
         x_onehot = F.one_hot(x[:, :-1], num_classes=self.vocab_size).float()
-        output, _ = self.gru(x_onehot, hidden)
-        logits = self.fc_out(output)
-        return logits
+        z_repeated = z.unsqueeze(1).expand(-1, seq_len, -1)
+        gru_input = torch.cat([x_onehot, z_repeated], dim=-1)
+        output, _ = self.gru(gru_input, hidden)
+        return self.fc_out(output)
 
 
 class PropertyPredictor(nn.Module):
-    def __init__(self, latent_dim, hidden_size=64, dropout=0.5):
+    def __init__(self, latent_dim, hidden_size=64, dropout=0.4):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(latent_dim, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, 1),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, 1),
         )
 
-    def forward(self, mu):
-        return self.net(mu).squeeze(-1)
+    def forward(self, z):
+        return self.net(z).squeeze(-1)
 
 
 class VAE(nn.Module):
