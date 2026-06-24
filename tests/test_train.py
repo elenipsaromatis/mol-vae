@@ -1,80 +1,95 @@
 import torch
-import pytest
+from data import MAX_LENGTH
 from model import VAE
-from train import vae_loss, evaluate_loss
-from data import build_dataloaders, MAX_LENGTH
-
-VOCAB_SIZE = 41
-BATCH_SIZE = 4
-DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+from train import compute_pos_weights, vae_loss
 
 
-@pytest.fixture
-def model():
-    return VAE(VOCAB_SIZE, MAX_LENGTH, 512, 128, 2).to(DEVICE)
-
-
-@pytest.fixture
-def dummy_inputs():
-    batch = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, MAX_LENGTH)).to(DEVICE)
-    labels = torch.randint(0, 2, (BATCH_SIZE,)).float().to(DEVICE)
-    train_labels = torch.randint(0, 2, (100,)).float()
-    return batch, labels, train_labels
-
-
-def test_vae_loss_returns_four_values(model, dummy_inputs):
-    batch, labels, train_labels = dummy_inputs
-    logits, mu, log_var, prop_logit = model(batch)
-    result = vae_loss(
-        logits, batch[:, 1:], mu, log_var, beta=0.008,
-        prop_logit=prop_logit, labels=labels,
-        gamma=0.05, kl_free_bits=0.5, train_labels=train_labels
+def test_compute_pos_weights():
+    labels = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 0.0],
+        ]
     )
-    assert len(result) == 4
+    weights = compute_pos_weights(labels, torch.device("cpu"))
+    assert torch.allclose(weights, torch.tensor([2.0, 1.0]))
 
 
-def test_vae_loss_is_positive(model, dummy_inputs):
-    batch, labels, train_labels = dummy_inputs
-    logits, mu, log_var, prop_logit = model(batch)
-    loss, recon, kl, prop = vae_loss(
-        logits, batch[:, 1:], mu, log_var, beta=0.008,
-        prop_logit=prop_logit, labels=labels,
-        gamma=0.05, kl_free_bits=0.5, train_labels=train_labels
+def test_vae_loss_uses_one_reconstruction_and_equal_property_weights():
+    batch_size = 3
+    seq_len = 8
+    vocab_size = 7
+    latent_dim = 4
+    gamma = 0.25
+    beta = 0.1
+
+    logits = torch.randn(batch_size, seq_len - 1, vocab_size, requires_grad=True)
+    targets = torch.randint(1, vocab_size, (batch_size, seq_len - 1))
+    mu = torch.randn(batch_size, latent_dim, requires_grad=True)
+    log_var = torch.randn(batch_size, latent_dim, requires_grad=True)
+    d6_logit = torch.randn(batch_size, requires_grad=True)
+    c19_logit = torch.randn(batch_size, requires_grad=True)
+    labels = torch.tensor([[0.0, 1.0], [1.0, 0.0], [1.0, 1.0]])
+    pos_weights = torch.tensor([1.0, 1.0])
+
+    loss, recon, kl, d6_loss, c19_loss = vae_loss(
+        logits=logits,
+        targets=targets,
+        mu=mu,
+        log_var=log_var,
+        cyp2d6_logit=d6_logit,
+        cyp2c19_logit=c19_logit,
+        labels=labels,
+        beta=beta,
+        gamma=gamma,
+        kl_free_bits=0.0,
+        pos_weights=pos_weights,
     )
-    assert loss.item() > 0
-    assert recon.item() > 0
-    assert kl.item() > 0
-    assert prop.item() > 0
+
+    expected = recon + beta * kl + gamma * d6_loss + gamma * c19_loss
+    assert torch.allclose(loss, expected)
 
 
-def test_vae_loss_zero_beta_zero_gamma(model, dummy_inputs):
-    batch, labels, train_labels = dummy_inputs
-    logits, mu, log_var, prop_logit = model(batch)
-    loss, recon, kl, prop = vae_loss(
-        logits, batch[:, 1:], mu, log_var, beta=0.0,
-        prop_logit=prop_logit, labels=labels,
-        gamma=0.0, kl_free_bits=0.5, train_labels=train_labels
+def test_both_predictors_receive_gradients():
+    vocab_size = 10
+    model = VAE(
+        vocab_size=vocab_size,
+        seq_len=MAX_LENGTH,
+        hidden_dim=64,
+        latent_dim=16,
+        n_layers=1,
+        dropout=0.0,
+        prop_hidden_size=16,
     )
-    assert torch.isclose(loss, recon)
-
-
-def test_vae_loss_is_scalar(model, dummy_inputs):
-    batch, labels, train_labels = dummy_inputs
-    logits, mu, log_var, prop_logit = model(batch)
-    loss, _, _, _ = vae_loss(
-        logits, batch[:, 1:], mu, log_var, beta=0.008,
-        prop_logit=prop_logit, labels=labels,
-        gamma=0.05, kl_free_bits=0.5, train_labels=train_labels
+    batch = torch.randint(1, vocab_size, (4, MAX_LENGTH))
+    labels = torch.tensor(
+        [[0.0, 1.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]
     )
-    assert loss.shape == torch.Size([])
-
-
-def test_evaluate_loss_returns_three_floats(model):
-    _, valid_loader, _, _, _, _, train_labels = build_dataloaders()
-    val_recon, val_kl, val_prop = evaluate_loss(
-        model, valid_loader, beta=0.008, gamma=0.05,
-        device=DEVICE, kl_free_bits=0.5, train_labels=train_labels
+    outputs = model(batch)
+    loss, *_ = vae_loss(
+        logits=outputs[0],
+        targets=batch[:, 1:],
+        mu=outputs[1],
+        log_var=outputs[2],
+        cyp2d6_logit=outputs[3],
+        cyp2c19_logit=outputs[4],
+        labels=labels,
+        beta=0.01,
+        gamma=0.1,
+        kl_free_bits=0.0,
+        pos_weights=torch.tensor([1.0, 1.0]),
     )
-    assert isinstance(val_recon, float)
-    assert isinstance(val_kl, float)
-    assert isinstance(val_prop, float)
+    loss.backward()
+
+    assert all(
+        parameter.grad is not None
+        for parameter in model.cyp2d6_predictor.parameters()
+    )
+    assert all(
+        parameter.grad is not None
+        for parameter in model.cyp2c19_predictor.parameters()
+    )

@@ -1,49 +1,408 @@
+import random
+from pathlib import Path
+import mlflow
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+
+from data import MAX_LENGTH, build_dataloaders
+from evaluate import evaluate, evaluate_auprc, evaluate_auroc, evaluate_test
+from model import VAE
 
 
-def vae_loss(logits, targets, mu, log_var, beta, prop_logit=None, labels=None, gamma=0.0, kl_free_bits=0.5, train_labels=None):
-    recon_loss = nn.CrossEntropyLoss(ignore_index=0, reduction='sum')(
-        logits.view(-1, logits.size(-1)),
-        targets.reshape(-1)
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
+
+if torch.backends.mps.is_available():
+    torch.backends.mps.deterministic = True
+
+torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+HIDDEN_DIM = 512
+LATENT_DIM = 256
+N_LAYERS = 3
+PROP_HIDDEN_SIZE = 32
+WEIGHT_DECAY = 5.414669339199985e-05
+EPOCHS = 50
+BETA_MAX = 0.48748000781458084
+ANNEAL_EPOCHS = 25
+BATCH_SIZE = 64
+LEARNING_RATE = 0.0009178680324771136
+KL_FREE_BITS = 0.7917042596673599
+GAMMA = 0.030010000333227073
+DROPOUT = 0.37030217137983146
+
+ROOT = Path(__file__).resolve().parent
+CHECKPOINT_DIR = ROOT / "checkpoints"
+
+
+def compute_pos_weights(train_labels, device):
+    if train_labels.ndim != 2 or train_labels.shape[1] != 2:
+        raise ValueError("train_labels must have shape [N, 2].")
+
+    weights = []
+    for task_index in range(2):
+        task_labels = train_labels[:, task_index]
+        positive_count = (task_labels == 1).sum().item()
+        negative_count = (task_labels == 0).sum().item()
+
+        if positive_count == 0:
+            raise ValueError(
+                f"Property column {task_index} contains no positive examples."
+            )
+
+        weights.append(negative_count / positive_count)
+
+    return torch.tensor(weights, dtype=torch.float, device=device)
+
+
+def vae_loss(
+    logits,
+    targets,
+    mu,
+    log_var,
+    cyp2d6_logit,
+    cyp2c19_logit,
+    labels,
+    beta,
+    gamma,
+    kl_free_bits,
+    pos_weights,
+):
+    recon_loss = nn.CrossEntropyLoss(ignore_index=0, reduction="sum")(
+        logits.reshape(-1, logits.size(-1)),
+        targets.reshape(-1),
     ) / (targets != 0).sum()
 
-    kl_per_dim = -0.5 * (1 + log_var - mu.pow(2) - log_var.exp())
+    kl_per_dim = -0.5 * (
+        1 + log_var - mu.pow(2) - log_var.exp()
+    )
     kl_per_dim = torch.clamp(kl_per_dim, min=kl_free_bits)
     kl_loss = torch.mean(torch.sum(kl_per_dim, dim=-1))
 
-    prop_loss = torch.tensor(0.0, device=logits.device)
-    if prop_logit is not None and labels is not None and gamma > 0 and train_labels is not None:
-        pos_weight = torch.tensor(
-            (train_labels == 0).sum().item() / (train_labels == 1).sum().item(),
-            device=logits.device
-        )
-        prop_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)(prop_logit, labels)
+    cyp2d6_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights[0])(
+        cyp2d6_logit, labels[:, 0]
+    )
+    cyp2c19_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights[1])(
+        cyp2c19_logit, labels[:, 1]
+    )
 
-    loss = recon_loss + beta * kl_loss + gamma * prop_loss
-    return loss, recon_loss, kl_loss, prop_loss
+    loss = (
+        recon_loss
+        + beta * kl_loss
+        + gamma * cyp2d6_loss
+        + gamma * cyp2c19_loss
+    )
+
+    return loss, recon_loss, kl_loss, cyp2d6_loss, cyp2c19_loss
 
 
-def evaluate_loss(model, loader, beta, gamma, device, kl_free_bits, train_labels):
+def evaluate_loss(
+    model,
+    loader,
+    beta,
+    gamma,
+    device,
+    kl_free_bits,
+    pos_weights,
+):
     model.eval()
-    total_recon, total_kl, total_prop, n = 0.0, 0.0, 0.0, 0
+    totals = {
+        "total": 0.0,
+        "recon": 0.0,
+        "kl": 0.0,
+        "cyp2d6": 0.0,
+        "cyp2c19": 0.0,
+    }
+
     with torch.no_grad():
         for batch, labels in loader:
             batch = batch.to(device)
             labels = labels.to(device)
-            logits, mu, log_var, prop_logit = model(batch)
-            _, recon, kl, prop = vae_loss(
-                logits, batch[:, 1:], mu, log_var, beta,
-                prop_logit=prop_logit, labels=labels,
-                gamma=gamma, kl_free_bits=kl_free_bits,
-                train_labels=train_labels
+
+            outputs = model(batch)
+            loss_values = vae_loss(
+                logits=outputs[0],
+                targets=batch[:, 1:],
+                mu=outputs[1],
+                log_var=outputs[2],
+                cyp2d6_logit=outputs[3],
+                cyp2c19_logit=outputs[4],
+                labels=labels,
+                beta=beta,
+                gamma=gamma,
+                kl_free_bits=kl_free_bits,
+                pos_weights=pos_weights,
             )
-            total_recon += recon.item()
-            total_kl += kl.item()
-            total_prop += prop.item()
-            n += 1
-    avg_recon = total_recon / n
-    avg_kl = total_kl / n
-    avg_prop = total_prop / n
-    avg_total = avg_recon + beta * avg_kl + gamma * avg_prop
-    return avg_recon, avg_kl, avg_prop, avg_total
+
+            for key, value in zip(totals, loss_values):
+                totals[key] += value.item()
+
+    number_of_batches = len(loader)
+    return tuple(value / number_of_batches for value in totals.values())
+
+
+def train():
+    if mlflow is None:
+        raise ImportError("MLflow is required. Install it with `pip install mlflow`.")
+    if SummaryWriter is None:
+        raise ImportError(
+            "TensorBoard is required. Install it with `pip install tensorboard`."
+        )
+
+    device = torch.device(
+        "mps" if torch.backends.mps.is_available() else "cpu"
+    )
+    print(f"Using device: {device}")
+
+    CHECKPOINT_DIR.mkdir(exist_ok=True)
+
+    (
+        train_loader,
+        valid_loader,
+        test_loader,
+        vocab_size,
+        char2idx,
+        idx2char,
+        train_labels,
+    ) = build_dataloaders(batch_size=BATCH_SIZE)
+
+    pos_weights = compute_pos_weights(train_labels, device)
+
+    MLFLOW_DIR = ROOT / "notebooks" / "mlruns"
+    mlflow.set_tracking_uri(MLFLOW_DIR.resolve().as_uri())
+
+    # Reuse the existing experiment. Do not silently create another one.
+    experiment = mlflow.get_experiment_by_name("mol-vae")
+    if experiment is None:
+        raise RuntimeError(
+            f"Existing MLflow experiment 'mol-vae' was not found in "
+            f"{MLFLOW_DIR.resolve()}"
+        )
+    mlflow.set_experiment(experiment_id=experiment.experiment_id)
+
+    print(f"MLflow tracking URI: {mlflow.get_tracking_uri()}")
+    print(
+        f"MLflow experiment: {experiment.name} "
+        f"(ID: {experiment.experiment_id})"
+    )
+
+    with mlflow.start_run() as run:
+        run_id = run.info.run_id
+        run_name = f"vae_overlap_{run_id[:8]}"
+        mlflow.set_tag("mlflow.runName", run_name)
+
+        model_path = CHECKPOINT_DIR / f"{run_name}.pth"
+        writer = SummaryWriter(log_dir=str(ROOT / "runs" / run_id[:8]))
+
+        mlflow.log_params(
+            {
+                "vocab_size": vocab_size,
+                "max_length": MAX_LENGTH,
+                "hidden_dim": HIDDEN_DIM,
+                "latent_dim": LATENT_DIM,
+                "n_layers": N_LAYERS,
+                "epochs": EPOCHS,
+                "anneal_epochs": ANNEAL_EPOCHS,
+                "beta_max": BETA_MAX,
+                "batch_size": BATCH_SIZE,
+                "learning_rate": LEARNING_RATE,
+                "kl_free_bits": KL_FREE_BITS,
+                "cyp2d6_gamma": GAMMA,
+                "cyp2c19_gamma": GAMMA,
+                "cyp2d6_pos_weight": pos_weights[0].item(),
+                "cyp2c19_pos_weight": pos_weights[1].item(),
+                "dataset": "CYP2D6/CYP2C19 overlap",
+                "split": "TDC CYP2D6 scaffold",
+                "scheduler": "CosineAnnealingLR",
+            }
+        )
+
+        model = VAE(
+            vocab_size=vocab_size,
+            seq_len=MAX_LENGTH,
+            hidden_dim=HIDDEN_DIM,
+            latent_dim=LATENT_DIM,
+            n_layers=N_LAYERS,
+            dropout=DROPOUT,
+            prop_hidden_size=PROP_HIDDEN_SIZE,
+        ).to(device)
+
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=LEARNING_RATE,
+            weight_decay=WEIGHT_DECAY,
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=EPOCHS, eta_min=1e-5
+        )
+
+        for epoch in range(EPOCHS):
+            model.train()
+            totals = {
+                "loss": 0.0,
+                "recon": 0.0,
+                "kl": 0.0,
+                "cyp2d6": 0.0,
+                "cyp2c19": 0.0,
+                "grad": 0.0,
+            }
+
+            beta = min(
+                BETA_MAX,
+                BETA_MAX * epoch / ANNEAL_EPOCHS,
+            )
+
+            for batch, labels in train_loader:
+                batch = batch.to(device)
+                labels = labels.to(device)
+                optimizer.zero_grad()
+
+                outputs = model(batch)
+                loss_values = vae_loss(
+                    logits=outputs[0],
+                    targets=batch[:, 1:],
+                    mu=outputs[1],
+                    log_var=outputs[2],
+                    cyp2d6_logit=outputs[3],
+                    cyp2c19_logit=outputs[4],
+                    labels=labels,
+                    beta=beta,
+                    gamma=GAMMA,
+                    kl_free_bits=KL_FREE_BITS,
+                    pos_weights=pos_weights,
+                )
+
+                loss_values[0].backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=1.0
+                )
+                optimizer.step()
+
+                for key, value in zip(
+                    ["loss", "recon", "kl", "cyp2d6", "cyp2c19"],
+                    loss_values,
+                ):
+                    totals[key] += value.item()
+                totals["grad"] += grad_norm.item()
+
+            number_of_batches = len(train_loader)
+            train_metrics = {
+                key: value / number_of_batches
+                for key, value in totals.items()
+            }
+
+            scheduler.step()
+
+            (
+                valid_total,
+                valid_recon,
+                valid_kl,
+                valid_cyp2d6,
+                valid_cyp2c19,
+            ) = evaluate_loss(
+                model,
+                valid_loader,
+                beta,
+                GAMMA,
+                device,
+                KL_FREE_BITS,
+                pos_weights,
+            )
+
+            valid_cyp2d6_auroc = evaluate_auroc(
+                model, valid_loader, device, "cyp2d6"
+            )
+            valid_cyp2d6_auprc = evaluate_auprc(
+                model, valid_loader, device, "cyp2d6"
+            )
+            valid_cyp2c19_auroc = evaluate_auroc(
+                model, valid_loader, device, "cyp2c19"
+            )
+            valid_cyp2c19_auprc = evaluate_auprc(
+                model, valid_loader, device, "cyp2c19"
+            )
+
+            exact_acc, token_acc, validity = evaluate(
+                model,
+                train_loader.dataset,
+                vocab_size,
+                device,
+                idx2char,
+            )
+            current_lr = optimizer.param_groups[0]["lr"]
+
+            print(
+                f"Epoch {epoch + 1:>2}/{EPOCHS}, beta: {beta:.4f}, "
+                f"Loss: {train_metrics['loss']:.4f}, "
+                f"Recon: {train_metrics['recon']:.4f}, "
+                f"KL: {train_metrics['kl']:.4f}, "
+                f"CYP2D6: {train_metrics['cyp2d6']:.4f}, "
+                f"CYP2C19: {train_metrics['cyp2c19']:.4f}, "
+                f"LR: {current_lr:.1e}"
+            )
+            print(
+                f"         Valid loss: {valid_total:.4f}, "
+                f"CYP2D6 AUPRC: {valid_cyp2d6_auprc:.4f}, "
+                f"CYP2C19 AUPRC: {valid_cyp2c19_auprc:.4f}, "
+                f"Recon acc: {exact_acc:.3f}, "
+                f"Token acc: {token_acc:.3f}, "
+                f"Validity: {validity:.3f}"
+            )
+
+            metrics = {
+                "train_loss": train_metrics["loss"],
+                "train_recon": train_metrics["recon"],
+                "train_kl": train_metrics["kl"],
+                "train_cyp2d6_loss": train_metrics["cyp2d6"],
+                "train_cyp2c19_loss": train_metrics["cyp2c19"],
+                "valid_loss": valid_total,
+                "valid_recon": valid_recon,
+                "valid_kl": valid_kl,
+                "valid_cyp2d6_loss": valid_cyp2d6,
+                "valid_cyp2c19_loss": valid_cyp2c19,
+                "valid_cyp2d6_auroc": valid_cyp2d6_auroc,
+                "valid_cyp2d6_auprc": valid_cyp2d6_auprc,
+                "valid_cyp2c19_auroc": valid_cyp2c19_auroc,
+                "valid_cyp2c19_auprc": valid_cyp2c19_auprc,
+                "grad_norm": train_metrics["grad"],
+                "beta": beta,
+                "learning_rate": current_lr,
+                "recon_acc": exact_acc,
+                "token_acc": token_acc,
+                "validity": validity,
+            }
+
+            mlflow.log_metrics(metrics, step=epoch + 1)
+            for name, value in metrics.items():
+                writer.add_scalar(name, value, epoch + 1)
+
+        test_metrics = evaluate_test(
+            model, test_loader, vocab_size, idx2char, device
+        )
+
+        print(
+            "\nTest: "
+            f"Recon acc: {test_metrics['recon_acc']:.3f}, "
+            f"Validity: {test_metrics['validity']:.3f}, "
+            f"CYP2D6 AUROC: {test_metrics['cyp2d6_auroc']:.3f}, "
+            f"CYP2D6 AUPRC: {test_metrics['cyp2d6_auprc']:.3f}, "
+            f"CYP2C19 AUROC: {test_metrics['cyp2c19_auroc']:.3f}, "
+            f"CYP2C19 AUPRC: {test_metrics['cyp2c19_auprc']:.3f}"
+        )
+        mlflow.log_metrics({f"test_{key}": value for key, value in test_metrics.items()})
+
+        torch.save(model.state_dict(), model_path)
+        mlflow.set_tag("checkpoint", str(model_path.resolve()))
+        writer.close()
+
+        print(f"\nModel saved as {model_path}")
+        print(f"Run ID: {run_id}")
+
+
+if __name__ == "__main__":
+    train()

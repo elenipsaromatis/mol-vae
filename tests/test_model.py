@@ -1,54 +1,70 @@
-import torch
 import pytest
-from model import VAE
+import torch
 from data import MAX_LENGTH
-
+from model import VAE, reparameterise
 VOCAB_SIZE = 41
 BATCH_SIZE = 4
-DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+HIDDEN_DIM = 128
+LATENT_DIM = 64
+N_LAYERS = 2
+PROP_HIDDEN_SIZE = 32
+DEVICE = torch.device("cpu")
 
 
 @pytest.fixture
 def model():
-    return VAE(VOCAB_SIZE, MAX_LENGTH, 512, 128, 2).to(DEVICE)
+    return VAE(
+        vocab_size=VOCAB_SIZE,
+        seq_len=MAX_LENGTH,
+        hidden_dim=HIDDEN_DIM,
+        latent_dim=LATENT_DIM,
+        n_layers=N_LAYERS,
+        dropout=0.5,
+        prop_hidden_size=PROP_HIDDEN_SIZE,
+    ).to(DEVICE)
 
 
 @pytest.fixture
 def dummy_batch():
-    return torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, MAX_LENGTH)).to(DEVICE)
+    return torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, MAX_LENGTH), device=DEVICE)
 
 
 def test_forward_output_shapes(model, dummy_batch):
-    logits, mu, log_var, prop_logit = model(dummy_batch)
+    logits, mu, log_var, cyp2d6_logit, cyp2c19_logit = model(dummy_batch)
     assert logits.shape == (BATCH_SIZE, MAX_LENGTH - 1, VOCAB_SIZE)
-    assert mu.shape == (BATCH_SIZE, 128)
-    assert log_var.shape == (BATCH_SIZE, 128)
-    assert prop_logit.shape == (BATCH_SIZE,)
+    assert mu.shape == (BATCH_SIZE, LATENT_DIM)
+    assert log_var.shape == (BATCH_SIZE, LATENT_DIM)
+    assert cyp2d6_logit.shape == (BATCH_SIZE,)
+    assert cyp2c19_logit.shape == (BATCH_SIZE,)
 
 
 def test_encoder_output_shapes(model, dummy_batch):
     mu, log_var = model.encoder(dummy_batch)
-    assert mu.shape == (BATCH_SIZE, 128)
-    assert log_var.shape == (BATCH_SIZE, 128)
+    assert mu.shape == (BATCH_SIZE, LATENT_DIM)
+    assert log_var.shape == (BATCH_SIZE, LATENT_DIM)
 
 
 def test_decoder_output_shape(model, dummy_batch):
     mu, log_var = model.encoder(dummy_batch)
-    logits = model.decoder(mu, dummy_batch)
+    z = reparameterise(mu, log_var)
+    logits = model.decoder(z, dummy_batch)
     assert logits.shape == (BATCH_SIZE, MAX_LENGTH - 1, VOCAB_SIZE)
 
 
-def test_property_predictor_output_shape(model, dummy_batch):
+def test_property_predictor_output_shapes(model, dummy_batch):
     mu, _ = model.encoder(dummy_batch)
-    prop_logit = model.predictor(mu)
-    assert prop_logit.shape == (BATCH_SIZE,)
+    assert model.cyp2d6_predictor(mu).shape == (BATCH_SIZE,)
+    assert model.cyp2c19_predictor(mu).shape == (BATCH_SIZE,)
 
 
-def test_model_on_device(model):
-    for param in model.parameters():
-        assert param.device.type == DEVICE.type
+def test_predictors_are_separate(model):
+    assert model.cyp2d6_predictor is not model.cyp2c19_predictor
+    for d6_parameter, c19_parameter in zip(
+        model.cyp2d6_predictor.parameters(),
+        model.cyp2c19_predictor.parameters(),
+    ):
+        assert d6_parameter is not c19_parameter
 
 
 def test_model_parameter_count(model):
-    n_params = sum(p.numel() for p in model.parameters())
-    assert n_params > 0
+    assert sum(parameter.numel() for parameter in model.parameters()) > 0
