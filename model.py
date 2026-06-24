@@ -101,12 +101,7 @@ class VAE(nn.Module):
         self.encoder = Encoder(vocab_size, seq_len, hidden_dim, latent_dim)
         self.decoder = Decoder(vocab_size, hidden_dim, latent_dim, n_layers)
 
-        self.cyp2d6_predictor = PropertyPredictor(
-            latent_dim,
-            hidden_size=prop_hidden_size,
-            dropout=dropout,
-        )
-        self.cyp2c19_predictor = PropertyPredictor(
+        self.reg_predictor = PropertyPredictor(
             latent_dim,
             hidden_size=prop_hidden_size,
             dropout=dropout,
@@ -116,7 +111,6 @@ class VAE(nn.Module):
         mu, log_var = self.encoder(x)
         z = reparameterise(mu, log_var)
         logits = self.decoder(z, x)
-        cyp2d6_logit = self.cyp2d6_predictor(mu)
-        cyp2c19_logit = self.cyp2c19_predictor(mu)
+        reg_pred = self.reg_predictor(mu)
 
-        return logits, mu, log_var, cyp2d6_logit, cyp2c19_logit
+        return logits, mu, log_var, reg_pred

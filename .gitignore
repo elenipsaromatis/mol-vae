@@ -8,3 +8,9 @@ mlflow.db
 runs/
 .claude/
 .DS_Store
+data/
+notebooks/data/
+checkpoints/
+notebooks/mlruns/
+*.pyc
+.venv/

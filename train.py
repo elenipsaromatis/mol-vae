@@ -8,7 +8,7 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
 from data import MAX_LENGTH, build_dataloaders
-from evaluate import evaluate, evaluate_auprc, evaluate_auroc, evaluate_test
+from evaluate import evaluate, evaluate_regression, evaluate_test
 from model import VAE
 
 
@@ -40,38 +40,16 @@ ROOT = Path(__file__).resolve().parent
 CHECKPOINT_DIR = ROOT / "checkpoints"
 
 
-def compute_pos_weights(train_labels, device):
-    if train_labels.ndim != 2 or train_labels.shape[1] != 2:
-        raise ValueError("train_labels must have shape [N, 2].")
-
-    weights = []
-    for task_index in range(2):
-        task_labels = train_labels[:, task_index]
-        positive_count = (task_labels == 1).sum().item()
-        negative_count = (task_labels == 0).sum().item()
-
-        if positive_count == 0:
-            raise ValueError(
-                f"Property column {task_index} contains no positive examples."
-            )
-
-        weights.append(negative_count / positive_count)
-
-    return torch.tensor(weights, dtype=torch.float, device=device)
-
-
 def vae_loss(
     logits,
     targets,
     mu,
     log_var,
-    cyp2d6_logit,
-    cyp2c19_logit,
+    reg_pred,
     labels,
     beta,
     gamma,
     kl_free_bits,
-    pos_weights,
 ):
     recon_loss = nn.CrossEntropyLoss(ignore_index=0, reduction="sum")(
         logits.reshape(-1, logits.size(-1)),
@@ -84,21 +62,11 @@ def vae_loss(
     kl_per_dim = torch.clamp(kl_per_dim, min=kl_free_bits)
     kl_loss = torch.mean(torch.sum(kl_per_dim, dim=-1))
 
-    cyp2d6_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights[0])(
-        cyp2d6_logit, labels[:, 0]
-    )
-    cyp2c19_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weights[1])(
-        cyp2c19_logit, labels[:, 1]
-    )
+    reg_loss = nn.MSELoss()(reg_pred, labels[:, 0])
 
-    loss = (
-        recon_loss
-        + beta * kl_loss
-        + gamma * cyp2d6_loss
-        + gamma * cyp2c19_loss
-    )
+    loss = recon_loss + beta * kl_loss + gamma * reg_loss
 
-    return loss, recon_loss, kl_loss, cyp2d6_loss, cyp2c19_loss
+    return loss, recon_loss, kl_loss, reg_loss
 
 
 def evaluate_loss(
@@ -108,15 +76,13 @@ def evaluate_loss(
     gamma,
     device,
     kl_free_bits,
-    pos_weights,
 ):
     model.eval()
     totals = {
         "total": 0.0,
         "recon": 0.0,
         "kl": 0.0,
-        "cyp2d6": 0.0,
-        "cyp2c19": 0.0,
+        "reg": 0.0,
     }
 
     with torch.no_grad():
@@ -130,13 +96,11 @@ def evaluate_loss(
                 targets=batch[:, 1:],
                 mu=outputs[1],
                 log_var=outputs[2],
-                cyp2d6_logit=outputs[3],
-                cyp2c19_logit=outputs[4],
+                reg_pred=outputs[3],
                 labels=labels,
                 beta=beta,
                 gamma=gamma,
                 kl_free_bits=kl_free_bits,
-                pos_weights=pos_weights,
             )
 
             for key, value in zip(totals, loss_values):
@@ -169,9 +133,9 @@ def train():
         char2idx,
         idx2char,
         train_labels,
+        reg_mean,
+        reg_std,
     ) = build_dataloaders(batch_size=BATCH_SIZE)
-
-    pos_weights = compute_pos_weights(train_labels, device)
 
     MLFLOW_DIR = ROOT / "notebooks" / "mlruns"
     mlflow.set_tracking_uri(MLFLOW_DIR.resolve().as_uri())
@@ -193,7 +157,7 @@ def train():
 
     with mlflow.start_run() as run:
         run_id = run.info.run_id
-        run_name = f"vae_overlap_{run_id[:8]}"
+        run_name = f"vae_solubility_{run_id[:8]}"
         mlflow.set_tag("mlflow.runName", run_name)
 
         model_path = CHECKPOINT_DIR / f"{run_name}.pth"
@@ -212,12 +176,11 @@ def train():
                 "batch_size": BATCH_SIZE,
                 "learning_rate": LEARNING_RATE,
                 "kl_free_bits": KL_FREE_BITS,
-                "cyp2d6_gamma": GAMMA,
-                "cyp2c19_gamma": GAMMA,
-                "cyp2d6_pos_weight": pos_weights[0].item(),
-                "cyp2c19_pos_weight": pos_weights[1].item(),
-                "dataset": "CYP2D6/CYP2C19 overlap",
-                "split": "TDC CYP2D6 scaffold",
+                "gamma": GAMMA,
+                "reg_mean": reg_mean.item(),
+                "reg_std": reg_std.item(),
+                "dataset": "Solubility_AqSolDB",
+                "split": "TDC Solubility scaffold",
                 "scheduler": "CosineAnnealingLR",
             }
         )
@@ -247,8 +210,7 @@ def train():
                 "loss": 0.0,
                 "recon": 0.0,
                 "kl": 0.0,
-                "cyp2d6": 0.0,
-                "cyp2c19": 0.0,
+                "reg": 0.0,
                 "grad": 0.0,
             }
 
@@ -268,13 +230,11 @@ def train():
                     targets=batch[:, 1:],
                     mu=outputs[1],
                     log_var=outputs[2],
-                    cyp2d6_logit=outputs[3],
-                    cyp2c19_logit=outputs[4],
+                    reg_pred=outputs[3],
                     labels=labels,
                     beta=beta,
                     gamma=GAMMA,
                     kl_free_bits=KL_FREE_BITS,
-                    pos_weights=pos_weights,
                 )
 
                 loss_values[0].backward()
@@ -284,7 +244,7 @@ def train():
                 optimizer.step()
 
                 for key, value in zip(
-                    ["loss", "recon", "kl", "cyp2d6", "cyp2c19"],
+                    ["loss", "recon", "kl", "reg"],
                     loss_values,
                 ):
                     totals[key] += value.item()
@@ -302,8 +262,7 @@ def train():
                 valid_total,
                 valid_recon,
                 valid_kl,
-                valid_cyp2d6,
-                valid_cyp2c19,
+                valid_reg,
             ) = evaluate_loss(
                 model,
                 valid_loader,
@@ -311,21 +270,13 @@ def train():
                 GAMMA,
                 device,
                 KL_FREE_BITS,
-                pos_weights,
             )
 
-            valid_cyp2d6_auroc = evaluate_auroc(
-                model, valid_loader, device, "cyp2d6"
+            valid_reg_metrics = evaluate_regression(
+                model, valid_loader, device, reg_mean, reg_std
             )
-            valid_cyp2d6_auprc = evaluate_auprc(
-                model, valid_loader, device, "cyp2d6"
-            )
-            valid_cyp2c19_auroc = evaluate_auroc(
-                model, valid_loader, device, "cyp2c19"
-            )
-            valid_cyp2c19_auprc = evaluate_auprc(
-                model, valid_loader, device, "cyp2c19"
-            )
+            valid_rmse = valid_reg_metrics["rmse"]
+            valid_mae = valid_reg_metrics["mae"]
 
             exact_acc, token_acc, validity = evaluate(
                 model,
@@ -341,14 +292,13 @@ def train():
                 f"Loss: {train_metrics['loss']:.4f}, "
                 f"Recon: {train_metrics['recon']:.4f}, "
                 f"KL: {train_metrics['kl']:.4f}, "
-                f"CYP2D6: {train_metrics['cyp2d6']:.4f}, "
-                f"CYP2C19: {train_metrics['cyp2c19']:.4f}, "
+                f"Reg: {train_metrics['reg']:.4f}, "
                 f"LR: {current_lr:.1e}"
             )
             print(
                 f"         Valid loss: {valid_total:.4f}, "
-                f"CYP2D6 AUPRC: {valid_cyp2d6_auprc:.4f}, "
-                f"CYP2C19 AUPRC: {valid_cyp2c19_auprc:.4f}, "
+                f"RMSE: {valid_rmse:.4f}, "
+                f"MAE: {valid_mae:.4f}, "
                 f"Recon acc: {exact_acc:.3f}, "
                 f"Token acc: {token_acc:.3f}, "
                 f"Validity: {validity:.3f}"
@@ -358,17 +308,13 @@ def train():
                 "train_loss": train_metrics["loss"],
                 "train_recon": train_metrics["recon"],
                 "train_kl": train_metrics["kl"],
-                "train_cyp2d6_loss": train_metrics["cyp2d6"],
-                "train_cyp2c19_loss": train_metrics["cyp2c19"],
+                "train_reg_loss": train_metrics["reg"],
                 "valid_loss": valid_total,
                 "valid_recon": valid_recon,
                 "valid_kl": valid_kl,
-                "valid_cyp2d6_loss": valid_cyp2d6,
-                "valid_cyp2c19_loss": valid_cyp2c19,
-                "valid_cyp2d6_auroc": valid_cyp2d6_auroc,
-                "valid_cyp2d6_auprc": valid_cyp2d6_auprc,
-                "valid_cyp2c19_auroc": valid_cyp2c19_auroc,
-                "valid_cyp2c19_auprc": valid_cyp2c19_auprc,
+                "valid_reg_loss": valid_reg,
+                "valid_rmse": valid_rmse,
+                "valid_mae": valid_mae,
                 "grad_norm": train_metrics["grad"],
                 "beta": beta,
                 "learning_rate": current_lr,
@@ -382,17 +328,15 @@ def train():
                 writer.add_scalar(name, value, epoch + 1)
 
         test_metrics = evaluate_test(
-            model, test_loader, vocab_size, idx2char, device
+            model, test_loader, vocab_size, idx2char, device, reg_mean, reg_std
         )
 
         print(
             "\nTest: "
             f"Recon acc: {test_metrics['recon_acc']:.3f}, "
             f"Validity: {test_metrics['validity']:.3f}, "
-            f"CYP2D6 AUROC: {test_metrics['cyp2d6_auroc']:.3f}, "
-            f"CYP2D6 AUPRC: {test_metrics['cyp2d6_auprc']:.3f}, "
-            f"CYP2C19 AUROC: {test_metrics['cyp2c19_auroc']:.3f}, "
-            f"CYP2C19 AUPRC: {test_metrics['cyp2c19_auprc']:.3f}"
+            f"RMSE: {test_metrics['rmse']:.3f}, "
+            f"MAE: {test_metrics['mae']:.3f}"
         )
         mlflow.log_metrics({f"test_{key}": value for key, value in test_metrics.items()})
 

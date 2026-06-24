@@ -89,53 +89,13 @@ def _get_tdc_dataframe(dataset):
 
 
 def build_dataloaders(batch_size=64):
-    """
-    Build overlap-only CYP2D6/CYP2C19 loaders.
+    """Single-task solubility (AqSolDB) regression loaders"""
+    sol_data = ADME(name="Solubility_AqSolDB")
+    sol_split = sol_data.get_split(method="scaffold")
 
-    Each sample has the form:
-        encoded SMILES -> [CYP2D6 label, CYP2C19 label]
-
-    TDC's CYP2D6 scaffold split is used as the master split. CYP2C19
-    labels are inner-joined into each partition, so every retained
-    molecule has both labels and stays in its CYP2D6 scaffold partition.
-    """
-    if ADME is None:
-        raise ImportError(
-            "PyTDC is required to build the real dataloaders. "
-            "Install it with `pip install PyTDC`."
-        )
-
-    cyp2d6_data = ADME(name="CYP2D6_Veith")
-    cyp2d6_split = cyp2d6_data.get_split(method="scaffold")
-
-    cyp2c19_data = ADME(name="CYP2C19_Veith")
-    cyp2c19_df = _get_tdc_dataframe(cyp2c19_data)
-
-    cyp2d6_train_df = _clean_property_dataframe(
-        cyp2d6_split["train"], "Y_cyp2d6"
-    )
-    cyp2d6_valid_df = _clean_property_dataframe(
-        cyp2d6_split["valid"], "Y_cyp2d6"
-    )
-    cyp2d6_test_df = _clean_property_dataframe(
-        cyp2d6_split["test"], "Y_cyp2d6"
-    )
-    cyp2c19_df = _clean_property_dataframe(cyp2c19_df, "Y_cyp2c19")
-
-    train_df = cyp2d6_train_df.merge(cyp2c19_df, on="Drug", how="inner")
-    valid_df = cyp2d6_valid_df.merge(cyp2c19_df, on="Drug", how="inner")
-    test_df = cyp2d6_test_df.merge(cyp2c19_df, on="Drug", how="inner")
-
-    for split_name, split_df in {
-        "train": train_df,
-        "valid": valid_df,
-        "test": test_df,
-    }.items():
-        if split_df.empty:
-            raise ValueError(
-                f"No overlapping CYP2D6/CYP2C19 molecules were found "
-                f"in the {split_name} split."
-            )
+    train_df = _clean_property_dataframe(sol_split["train"], "Y_sol")
+    valid_df = _clean_property_dataframe(sol_split["valid"], "Y_sol")
+    test_df = _clean_property_dataframe(sol_split["test"], "Y_sol")
 
     train_smiles = train_df["Drug"].tolist()
     valid_smiles = valid_df["Drug"].tolist()
@@ -143,33 +103,37 @@ def build_dataloaders(batch_size=64):
 
     all_smiles = train_smiles + valid_smiles + test_smiles
     vocab = ["<pad>", "<sos>", "<eos>"] + sorted(set("".join(all_smiles)))
-    char2idx = {character: index for index, character in enumerate(vocab)}
-    idx2char = {index: character for character, index in char2idx.items()}
+    char2idx = {c: i for i, c in enumerate(vocab)}
+    idx2char = {i: c for c, i in char2idx.items()}
     vocab_size = len(vocab)
 
     encoded_train = torch.tensor(
-        [encode_smiles(smi, char2idx, MAX_LENGTH) for smi in train_smiles],
+        [encode_smiles(s, char2idx, MAX_LENGTH) for s in train_smiles],
         dtype=torch.long,
     )
     encoded_valid = torch.tensor(
-        [encode_smiles(smi, char2idx, MAX_LENGTH) for smi in valid_smiles],
+        [encode_smiles(s, char2idx, MAX_LENGTH) for s in valid_smiles],
         dtype=torch.long,
     )
     encoded_test = torch.tensor(
-        [encode_smiles(smi, char2idx, MAX_LENGTH) for smi in test_smiles],
+        [encode_smiles(s, char2idx, MAX_LENGTH) for s in test_smiles],
         dtype=torch.long,
     )
 
-    label_columns = ["Y_cyp2d6", "Y_cyp2c19"]
     train_labels = torch.tensor(
-        train_df[label_columns].to_numpy(dtype=np.float32), dtype=torch.float
+        train_df[["Y_sol"]].to_numpy(dtype=np.float32), dtype=torch.float
     )
     valid_labels = torch.tensor(
-        valid_df[label_columns].to_numpy(dtype=np.float32), dtype=torch.float
+        valid_df[["Y_sol"]].to_numpy(dtype=np.float32), dtype=torch.float
     )
     test_labels = torch.tensor(
-        test_df[label_columns].to_numpy(dtype=np.float32), dtype=torch.float
+        test_df[["Y_sol"]].to_numpy(dtype=np.float32), dtype=torch.float
     )
+
+    reg_mean = train_labels[:, 0].mean()
+    reg_std = train_labels[:, 0].std()
+    for t in (train_labels, valid_labels, test_labels):
+        t[:, 0] = (t[:, 0] - reg_mean) / reg_std
 
     train_dataset = SMILESDataset(encoded_train, train_labels)
     valid_dataset = SMILESDataset(encoded_valid, valid_labels)
@@ -179,37 +143,18 @@ def build_dataloaders(batch_size=64):
     generator.manual_seed(42)
 
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        generator=generator,
+        train_dataset, batch_size=batch_size, shuffle=True, generator=generator
     )
     valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    cyp2d6_train_labels = train_labels[:, 0]
-    cyp2c19_train_labels = train_labels[:, 1]
 
-    d6_pos = (cyp2d6_train_labels == 1).sum().item()
-    d6_neg = (cyp2d6_train_labels == 0).sum().item()
-    c19_pos = (cyp2c19_train_labels == 1).sum().item()
-    c19_neg = (cyp2c19_train_labels == 0).sum().item()
-
-    print("[split] method=TDC CYP2D6 scaffold")
-    print("[split] dataset=CYP2D6/CYP2C19 overlap")
     print(
         "[split] sizes train/valid/test: "
         f"{len(train_df)}/{len(valid_df)}/{len(test_df)}"
     )
     print(f"[split] vocab_size: {vocab_size}")
-    print(
-        f"[CYP2D6] train pos/neg: {d6_pos}/{d6_neg}  "
-        f"pos_weight: {d6_neg / d6_pos:.3f}"
-    )
-    print(
-        f"[CYP2C19] train pos/neg: {c19_pos}/{c19_neg}  "
-        f"pos_weight: {c19_neg / c19_pos:.3f}"
-    )
+    print(f"[target] mean/std: {reg_mean:.3f}/{reg_std:.3f}")
 
     return (
         train_loader,
@@ -219,4 +164,6 @@ def build_dataloaders(batch_size=64):
         char2idx,
         idx2char,
         train_labels,
+        reg_mean,
+        reg_std,
     )

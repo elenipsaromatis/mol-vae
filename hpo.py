@@ -7,9 +7,9 @@ import optuna
 import torch
 
 from data import MAX_LENGTH, build_dataloaders
-from evaluate import evaluate_auprc, evaluate_auroc
+from evaluate import evaluate_regression
 from model import VAE
-from train import compute_pos_weights, evaluate_loss, vae_loss
+from train import evaluate_loss, vae_loss
 
 
 torch.manual_seed(42)
@@ -31,24 +31,23 @@ def make_objective(
     train_loader,
     valid_loader,
     vocab_size,
-    train_labels,
+    reg_mean,
+    reg_std,
     device,
     n_epochs,
 ):
-    pos_weights = compute_pos_weights(train_labels, device)
-
     def objective(trial):
         beta_max = trial.suggest_float(
             "beta_max",
-            0.004,
-            0.5,
+            1e-4,
+            0.1,
             log=True,
         )
 
         gamma = trial.suggest_float(
             "gamma",
-            0.005,
-            1,
+            0.01,
+            5.0,
             log=True,
         )
 
@@ -126,8 +125,6 @@ def make_objective(
                 {
                     "beta_max": beta_max,
                     "gamma": gamma,
-                    "cyp2d6_gamma": gamma,
-                    "cyp2c19_gamma": gamma,
                     "learning_rate": learning_rate,
                     "weight_decay": weight_decay,
                     "dropout": dropout,
@@ -137,10 +134,10 @@ def make_objective(
                     "prop_hidden_size": prop_hidden_size,
                     "hidden_dim": HIDDEN_DIM,
                     "batch_size": BATCH_SIZE,
-                    "cyp2d6_pos_weight": pos_weights[0].item(),
-                    "cyp2c19_pos_weight": pos_weights[1].item(),
-                    "dataset": "CYP2D6/CYP2C19 overlap",
-                    "split": "TDC CYP2D6 scaffold",
+                    "reg_mean": reg_mean.item(),
+                    "reg_std": reg_std.item(),
+                    "dataset": "Solubility_AqSolDB",
+                    "split": "TDC Solubility scaffold",
                 }
             )
 
@@ -162,28 +159,24 @@ def make_objective(
                         logits,
                         mu,
                         log_var,
-                        cyp2d6_logit,
-                        cyp2c19_logit,
+                        reg_pred,
                     ) = model(batch)
 
                     (
                         loss,
                         recon_loss,
                         kl_loss,
-                        cyp2d6_loss,
-                        cyp2c19_loss,
+                        reg_loss,
                     ) = vae_loss(
                         logits=logits,
                         targets=batch[:, 1:],
                         mu=mu,
                         log_var=log_var,
-                        cyp2d6_logit=cyp2d6_logit,
-                        cyp2c19_logit=cyp2c19_logit,
+                        reg_pred=reg_pred,
                         labels=labels,
                         beta=beta,
                         gamma=gamma,
                         kl_free_bits=kl_free_bits,
-                        pos_weights=pos_weights,
                     )
 
                     loss.backward()
@@ -201,8 +194,7 @@ def make_objective(
                     valid_total,
                     valid_recon,
                     valid_kl,
-                    valid_cyp2d6_loss,
-                    valid_cyp2c19_loss,
+                    valid_reg_loss,
                 ) = evaluate_loss(
                     model=model,
                     loader=valid_loader,
@@ -210,59 +202,28 @@ def make_objective(
                     gamma=gamma,
                     device=device,
                     kl_free_bits=kl_free_bits,
-                    pos_weights=pos_weights,
                 )
 
-                valid_cyp2d6_auroc = evaluate_auroc(
+                valid_reg_metrics = evaluate_regression(
                     model,
                     valid_loader,
                     device,
-                    "cyp2d6",
+                    reg_mean,
+                    reg_std,
                 )
+                valid_rmse = valid_reg_metrics["rmse"]
+                valid_mae = valid_reg_metrics["mae"]
 
-                valid_cyp2c19_auroc = evaluate_auroc(
-                    model,
-                    valid_loader,
-                    device,
-                    "cyp2c19",
-                )
-
-                valid_cyp2d6_auprc = evaluate_auprc(
-                    model,
-                    valid_loader,
-                    device,
-                    "cyp2d6",
-                )
-
-                valid_cyp2c19_auprc = evaluate_auprc(
-                    model,
-                    valid_loader,
-                    device,
-                    "cyp2c19",
-                )
-
-                mean_valid_prop_loss = 0.5 * (
-                    valid_cyp2d6_loss
-                    + valid_cyp2c19_loss
-                )
-
-                val_score = (
-                    valid_recon
-                    + mean_valid_prop_loss
-                )
+                val_score = valid_recon + valid_reg_loss
 
                 mlflow.log_metrics(
                     {
                         "valid_total": valid_total,
                         "valid_recon": valid_recon,
                         "valid_kl": valid_kl,
-                        "valid_cyp2d6_loss": valid_cyp2d6_loss,
-                        "valid_cyp2c19_loss": valid_cyp2c19_loss,
-                        "valid_mean_prop_loss": mean_valid_prop_loss,
-                        "valid_cyp2d6_auroc": valid_cyp2d6_auroc,
-                        "valid_cyp2c19_auroc": valid_cyp2c19_auroc,
-                        "valid_cyp2d6_auprc": valid_cyp2d6_auprc,
-                        "valid_cyp2c19_auprc": valid_cyp2c19_auprc,
+                        "valid_reg_loss": valid_reg_loss,
+                        "valid_rmse": valid_rmse,
+                        "valid_mae": valid_mae,
                         "val_score": val_score,
                         "beta": beta,
                         "learning_rate": optimizer.param_groups[0]["lr"],
@@ -302,19 +263,21 @@ def run_hpo(n_trials=50, n_epochs=20):
         char2idx,
         idx2char,
         train_labels,
+        reg_mean,
+        reg_std,
     ) = build_dataloaders(
         batch_size=BATCH_SIZE
     )
 
     print(f"vocab_size: {vocab_size}")
-    print(f"overlap training labels shape: {tuple(train_labels.shape)}")
+    print(f"training labels shape: {tuple(train_labels.shape)}")
 
     mlflow.set_tracking_uri(
         (ROOT / "mlruns").resolve().as_uri()
     )
 
     mlflow.set_experiment(
-        "vae-overlap-multitask-hpo"
+        "vae-solubility-hpo"
     )
 
     sampler = optuna.samplers.TPESampler(
@@ -331,18 +294,19 @@ def run_hpo(n_trials=50, n_epochs=20):
         direction="minimize",
         sampler=sampler,
         pruner=pruner,
-        study_name="vae_overlap_multitask_hpo",
+        study_name="vae_solubility_hpo",
     )
 
     with mlflow.start_run(
-        run_name="hpo_overlap_multitask"
+        run_name="hpo_solubility"
     ):
         study.optimize(
             make_objective(
                 train_loader=train_loader,
                 valid_loader=valid_loader,
                 vocab_size=vocab_size,
-                train_labels=train_labels,
+                reg_mean=reg_mean,
+                reg_std=reg_std,
                 device=device,
                 n_epochs=n_epochs,
             ),

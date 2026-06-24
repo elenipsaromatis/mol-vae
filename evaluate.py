@@ -1,48 +1,38 @@
 import torch
 from rdkit import Chem
-from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
-from model import reparameterise
 
 
-TASK_COLUMN = {
-    "cyp2d6": 0,
-    "cyp2c19": 1,
-}
-
-
-def _predictor_for(model, task):
-    return getattr(model, f"{task}_predictor")
-
-
-def _collect_property(model, loader, device, task):
-    """Return (labels, logits) numpy arrays for one task. Predictor reads mu."""
-    column = TASK_COLUMN[task]
-    predictor = _predictor_for(model, task)
+def _collect_regression(model, loader, device):
+    """Return (labels, preds) tensors for the regression head. Predictor reads mu."""
     model.eval()
-    logits, labels = [], []
+    preds, labels = [], []
     with torch.no_grad():
         for batch, batch_labels in loader:
             batch = batch.to(device)
             mu, _ = model.encoder(batch)
-            logits.append(predictor(mu).cpu())
-            labels.append(batch_labels[:, column])
-    return torch.cat(labels).numpy(), torch.cat(logits).numpy()
+            preds.append(model.reg_predictor(mu).reshape(-1).cpu())
+            labels.append(batch_labels[:, 0])
+    return torch.cat(labels), torch.cat(preds)
 
 
-def evaluate_auroc(model, loader, device, task):
-    labels, logits = _collect_property(model, loader, device, task)
-    return roc_auc_score(labels, logits)
+def evaluate_regression(model, loader, device, reg_mean, reg_std):
+    """RMSE and MAE in original target units (inverts standardization)."""
+    labels, preds = _collect_regression(model, loader, device)
 
+    reg_mean = reg_mean.cpu()
+    reg_std = reg_std.cpu()
+    preds = preds * reg_std + reg_mean
+    labels = labels * reg_std + reg_mean
 
-def evaluate_auprc(model, loader, device, task):
-    labels, logits = _collect_property(model, loader, device, task)
-    precision, recall, _ = precision_recall_curve(labels, logits)
-    return auc(recall, precision)
+    rmse = torch.sqrt(((preds - labels) ** 2).mean()).item()
+    mae = (preds - labels).abs().mean().item()
+    return {"rmse": rmse, "mae": mae}
 
 
 def evaluate(model, dataset, vocab_size, device, idx2char, n_samples=500):
     """Reconstruction metric on a random subset. Decoder reads mu (deterministic)."""
     model.eval()
+    n_samples = min(n_samples, len(dataset))
     indices = torch.randperm(len(dataset))[:n_samples]
     batch = torch.stack([dataset[i][0] for i in indices]).to(device)
 
@@ -72,27 +62,23 @@ def evaluate(model, dataset, vocab_size, device, idx2char, n_samples=500):
     return exact_acc, token_acc, validity
 
 
-def evaluate_test(model, loader, vocab_size, idx2char, device):
-    """Full test metrics as a dict. Decoder reads mu (deterministic), predictors read mu."""
+def evaluate_test(model, loader, vocab_size, idx2char, device, reg_mean, reg_std):
+    """Full test metrics as a dict. Decoder reads mu (deterministic), predictor reads mu."""
     model.eval()
     all_logits, all_targets = [], []
-    prop_logits = {task: [] for task in TASK_COLUMN}
-    prop_labels = {task: [] for task in TASK_COLUMN}
+    preds, labels = [], []
 
     with torch.no_grad():
-        for batch, labels in loader:
+        for batch, batch_labels in loader:
             batch = batch.to(device)
-            mu, log_var = model.encoder(batch)
-            z = reparameterise(mu, log_var)
+            mu, _ = model.encoder(batch)
             logits = model.decoder(mu, batch)
 
             all_logits.append(logits)
             all_targets.append(batch[:, 1:])
 
-            for task, column in TASK_COLUMN.items():
-                predictor = _predictor_for(model, task)
-                prop_logits[task].append(predictor(mu).cpu())
-                prop_labels[task].append(labels[:, column])
+            preds.append(model.reg_predictor(mu).reshape(-1).cpu())
+            labels.append(batch_labels[:, 0])
 
     all_logits = torch.cat(all_logits, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
@@ -112,12 +98,19 @@ def evaluate_test(model, loader, vocab_size, idx2char, device):
             valid_count += 1
     validity = valid_count / len(pred_tokens)
 
-    metrics = {"recon_acc": recon_acc, "validity": validity}
-    for task in TASK_COLUMN:
-        y_true = torch.cat(prop_labels[task]).numpy()
-        y_score = torch.cat(prop_logits[task]).numpy()
-        precision, recall, _ = precision_recall_curve(y_true, y_score)
-        metrics[f"{task}_auroc"] = roc_auc_score(y_true, y_score)
-        metrics[f"{task}_auprc"] = auc(recall, precision)
+    preds = torch.cat(preds)
+    labels = torch.cat(labels)
+    reg_mean = reg_mean.cpu()
+    reg_std = reg_std.cpu()
+    preds = preds * reg_std + reg_mean
+    labels = labels * reg_std + reg_mean
 
-    return metrics
+    rmse = torch.sqrt(((preds - labels) ** 2).mean()).item()
+    mae = (preds - labels).abs().mean().item()
+
+    return {
+        "recon_acc": recon_acc,
+        "validity": validity,
+        "rmse": rmse,
+        "mae": mae,
+    }
