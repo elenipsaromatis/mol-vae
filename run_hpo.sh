@@ -17,6 +17,7 @@ PROJECT_ROOT="${PBS_O_WORKDIR:-$PWD}"
 cd "$PROJECT_ROOT"
 
 export PYTHONPATH="$PROJECT_ROOT:${PYTHONPATH:-}"
+export MLFLOW_ALLOW_FILE_STORE=true
 
 # Prevent thread oversubscription across 4 parallel Optuna workers.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
