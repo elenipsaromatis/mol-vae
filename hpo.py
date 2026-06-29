@@ -253,7 +253,7 @@ def make_objective(
     return objective
 
 
-def run_hpo(n_trials=50, n_epochs=20):
+def run_hpo(n_trials=50, n_epochs=50):
     device = get_device()
     print(f"Using device: {device}")
 
@@ -313,6 +313,7 @@ def run_hpo(n_trials=50, n_epochs=20):
                 n_epochs=n_epochs,
             ),
             n_trials=n_trials,
+            n_jobs=4,
         )
 
     print("Best params:", study.best_params)
@@ -322,4 +323,11 @@ def run_hpo(n_trials=50, n_epochs=20):
 
 
 if __name__ == "__main__":
-    study = run_hpo()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n_trials", type=int, default=50)
+    parser.add_argument("--n_epochs", type=int, default=50)
+    args = parser.parse_args()
+
+    study = run_hpo(n_trials=args.n_trials, n_epochs=args.n_epochs)
