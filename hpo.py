@@ -1,3 +1,4 @@
+import json
 import random
 from pathlib import Path
 
@@ -10,6 +11,10 @@ from data import MAX_LENGTH, build_dataloaders
 from evaluate import evaluate_regression
 from model import VAE
 from train import evaluate_loss, vae_loss
+
+
+from optuna.storages import JournalStorage
+from optuna.storages.journal import JournalFileBackend
 
 
 torch.manual_seed(42)
@@ -47,7 +52,7 @@ def make_objective(
         beta_max = trial.suggest_float(
             "beta_max",
             1e-4,
-            0.1,
+            1.0,
             log=True,
         )
 
@@ -292,11 +297,17 @@ def run_hpo(n_trials=50, n_epochs=50):
         n_warmup_steps=10,
     )
 
+    storage = JournalStorage(
+        JournalFileBackend(str(ROOT / "optuna_study.log"))
+    )
+
     study = optuna.create_study(
         direction="minimize",
         sampler=sampler,
         pruner=pruner,
         study_name="vae_solubility_hpo",
+        storage=storage,
+        load_if_exists=True,
     )
 
     with mlflow.start_run(
@@ -318,6 +329,16 @@ def run_hpo(n_trials=50, n_epochs=50):
 
     print("Best params:", study.best_params)
     print("Best score:", study.best_value)
+
+    best = {
+        "best_params": study.best_params,
+        "best_value": study.best_value,
+        "best_trial": study.best_trial.number,
+    }
+    best_path = ROOT / "best_params.json"
+    with open(best_path, "w") as f:
+        json.dump(best, f, indent=2)
+    print(f"Saved best params to {best_path}")
 
     return study
 
