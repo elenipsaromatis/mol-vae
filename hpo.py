@@ -26,6 +26,13 @@ HIDDEN_DIM = 512
 BATCH_SIZE = 64
 ROOT = Path(__file__).resolve().parent
 
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
 
 def make_objective(
     train_loader,
@@ -247,12 +254,7 @@ def make_objective(
 
 
 def run_hpo(n_trials=50, n_epochs=20):
-    device = torch.device(
-        "mps"
-        if torch.backends.mps.is_available()
-        else "cpu"
-    )
-
+    device = get_device()
     print(f"Using device: {device}")
 
     (

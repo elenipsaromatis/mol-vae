@@ -23,21 +23,30 @@ torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 HIDDEN_DIM = 512
-LATENT_DIM = 256
+LATENT_DIM = 100
 N_LAYERS = 3
 PROP_HIDDEN_SIZE = 32
-WEIGHT_DECAY = 5.414669339199985e-05
+WEIGHT_DECAY = 4.3632866875951974e-05
 EPOCHS = 50
-BETA_MAX = 0.48748000781458084
+BETA_MAX = 0.00039913734909661076
 ANNEAL_EPOCHS = 25
 BATCH_SIZE = 64
-LEARNING_RATE = 0.0009178680324771136
-KL_FREE_BITS = 0.7917042596673599
-GAMMA = 0.030010000333227073
-DROPOUT = 0.37030217137983146
+LEARNING_RATE = 0.0008526577085759847
+KL_FREE_BITS = 0.7067880262850101
+GAMMA = 0.06929960590143402
+DROPOUT = 0.20784956926076428
+PATIENCE = 3
+MIN_DELTA = 1e-3
 
 ROOT = Path(__file__).resolve().parent
 CHECKPOINT_DIR = ROOT / "checkpoints"
+
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def vae_loss(
@@ -118,9 +127,7 @@ def train():
             "TensorBoard is required. Install it with `pip install tensorboard`."
         )
 
-    device = torch.device(
-        "mps" if torch.backends.mps.is_available() else "cpu"
-    )
+    device = get_device()
     print(f"Using device: {device}")
 
     CHECKPOINT_DIR.mkdir(exist_ok=True)
@@ -140,7 +147,6 @@ def train():
     MLFLOW_DIR = ROOT / "notebooks" / "mlruns"
     mlflow.set_tracking_uri(MLFLOW_DIR.resolve().as_uri())
 
-    # Reuse the existing experiment. Do not silently create another one.
     experiment = mlflow.get_experiment_by_name("mol-vae")
     if experiment is None:
         raise RuntimeError(
@@ -160,7 +166,8 @@ def train():
         run_name = f"vae_solubility_{run_id[:8]}"
         mlflow.set_tag("mlflow.runName", run_name)
 
-        model_path = CHECKPOINT_DIR / f"{run_name}.pth"
+        model_path = CHECKPOINT_DIR / f"{run_name}_final.pth"
+        best_model_path = CHECKPOINT_DIR / f"{run_name}_best.pth"
         writer = SummaryWriter(log_dir=str(ROOT / "runs" / run_id[:8]))
 
         mlflow.log_params(
@@ -203,6 +210,10 @@ def train():
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=EPOCHS, eta_min=1e-5
         )
+
+        best_val_loss = float("inf")
+        best_epoch = -1
+        epochs_no_improve = 0
 
         for epoch in range(EPOCHS):
             model.train()
@@ -327,6 +338,35 @@ def train():
             for name, value in metrics.items():
                 writer.add_scalar(name, value, epoch + 1)
 
+            if epoch >= ANNEAL_EPOCHS:
+                improved = valid_total < best_val_loss - MIN_DELTA
+                if improved:
+                    best_val_loss = valid_total
+                    best_epoch = epoch
+                    epochs_no_improve = 0
+                    torch.save(model.state_dict(), best_model_path)
+                    mlflow.log_metric(
+                        "best_valid_loss", best_val_loss, step=epoch + 1
+                    )
+                else:
+                    epochs_no_improve += 1
+                    if epochs_no_improve >= PATIENCE:
+                        print(
+                            f"Early stopping at epoch {epoch + 1}, "
+                            f"best epoch {best_epoch + 1} "
+                            f"(valid_loss {best_val_loss:.4f})"
+                        )
+                        break
+
+        torch.save(model.state_dict(), model_path)
+
+        if best_epoch >= 0:
+            model.load_state_dict(torch.load(best_model_path))
+            print(f"Reloaded best model from epoch {best_epoch + 1}")
+            eval_checkpoint = best_model_path
+        else:
+            eval_checkpoint = model_path
+
         test_metrics = evaluate_test(
             model, test_loader, vocab_size, idx2char, device, reg_mean, reg_std
         )
@@ -340,11 +380,15 @@ def train():
         )
         mlflow.log_metrics({f"test_{key}": value for key, value in test_metrics.items()})
 
-        torch.save(model.state_dict(), model_path)
-        mlflow.set_tag("checkpoint", str(model_path.resolve()))
+        mlflow.set_tag("final_checkpoint", str(model_path.resolve()))
+        if best_epoch >= 0:
+            mlflow.set_tag("best_checkpoint", str(best_model_path.resolve()))
+        mlflow.set_tag("eval_checkpoint", str(eval_checkpoint.resolve()))
         writer.close()
 
-        print(f"\nModel saved as {model_path}")
+        print(f"\nFinal model saved as {model_path}")
+        if best_epoch >= 0:
+            print(f"Best model saved as {best_model_path}")
         print(f"Run ID: {run_id}")
 
 
