@@ -4,6 +4,7 @@ import torch
 from rdkit import Chem
 from torch.utils.data import DataLoader, Dataset
 from tdc.single_pred import ADME
+from tdc.single_pred import Tox
 
 MAX_LENGTH = 100
 
@@ -166,4 +167,101 @@ def build_dataloaders(batch_size=64):
         train_labels,
         reg_mean,
         reg_std,
+    )
+
+def build_dataloaders_multitask(batch_size=64):
+    """Solubility (AqSolDB, scaffold split) + LD50_Zhu overlap"""
+    sol_data = ADME(name="Solubility_AqSolDB")
+    sol_split = sol_data.get_split(method="scaffold")
+
+    ld50_df = _get_tdc_dataframe(Tox(name="LD50_Zhu"))
+    ld50_clean = _clean_property_dataframe(ld50_df, "Y_ld50")
+
+    def build_partition(df):
+        cleaned = _clean_property_dataframe(df, "Y_sol")
+        merged = cleaned.merge(
+            ld50_clean[["Drug", "Y_ld50"]], on="Drug", how="inner"
+        )
+        return merged
+
+    train_df = build_partition(sol_split["train"])
+    valid_df = build_partition(sol_split["valid"])
+    test_df = build_partition(sol_split["test"])
+
+    train_smiles = train_df["Drug"].tolist()
+    valid_smiles = valid_df["Drug"].tolist()
+    test_smiles = test_df["Drug"].tolist()
+
+    all_smiles = train_smiles + valid_smiles + test_smiles
+    vocab = ["<pad>", "<sos>", "<eos>"] + sorted(set("".join(all_smiles)))
+    char2idx = {c: i for i, c in enumerate(vocab)}
+    idx2char = {i: c for c, i in char2idx.items()}
+    vocab_size = len(vocab)
+
+    encoded_train = torch.tensor(
+        [encode_smiles(s, char2idx, MAX_LENGTH) for s in train_smiles],
+        dtype=torch.long,
+    )
+    encoded_valid = torch.tensor(
+        [encode_smiles(s, char2idx, MAX_LENGTH) for s in valid_smiles],
+        dtype=torch.long,
+    )
+    encoded_test = torch.tensor(
+        [encode_smiles(s, char2idx, MAX_LENGTH) for s in test_smiles],
+        dtype=torch.long,
+    )
+
+    train_labels = torch.tensor(
+        train_df[["Y_sol", "Y_ld50"]].to_numpy(dtype=np.float32), dtype=torch.float
+    )
+    valid_labels = torch.tensor(
+        valid_df[["Y_sol", "Y_ld50"]].to_numpy(dtype=np.float32), dtype=torch.float
+    )
+    test_labels = torch.tensor(
+        test_df[["Y_sol", "Y_ld50"]].to_numpy(dtype=np.float32), dtype=torch.float
+    )
+
+    # standardize both targets independently
+    sol_mean = train_labels[:, 0].mean()
+    sol_std = train_labels[:, 0].std()
+    ld50_mean = train_labels[:, 1].mean()
+    ld50_std = train_labels[:, 1].std()
+
+    for t in (train_labels, valid_labels, test_labels):
+        t[:, 0] = (t[:, 0] - sol_mean) / sol_std
+        t[:, 1] = (t[:, 1] - ld50_mean) / ld50_std
+
+    train_dataset = SMILESDataset(encoded_train, train_labels)
+    valid_dataset = SMILESDataset(encoded_valid, valid_labels)
+    test_dataset = SMILESDataset(encoded_test, test_labels)
+
+    generator = torch.Generator()
+    generator.manual_seed(42)
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, generator=generator
+    )
+    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    print(
+        "[split] sizes train/valid/test: "
+        f"{len(train_df)}/{len(valid_df)}/{len(test_df)}"
+    )
+    print(f"[split] vocab_size: {vocab_size}")
+    print(f"[target] solubility mean/std: {sol_mean:.3f}/{sol_std:.3f}")
+    print(f"[target] LD50 mean/std: {ld50_mean:.3f}/{ld50_std:.3f}")
+
+    return (
+        train_loader,
+        valid_loader,
+        test_loader,
+        vocab_size,
+        char2idx,
+        idx2char,
+        train_labels,
+        sol_mean,
+        sol_std,
+        ld50_mean,
+        ld50_std,
     )

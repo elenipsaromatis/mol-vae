@@ -106,11 +106,17 @@ class VAE(nn.Module):
             hidden_size=prop_hidden_size,
             dropout=dropout,
         )
+        self.ld50_predictor = PropertyPredictor(
+            latent_dim,
+            hidden_size=prop_hidden_size,
+            dropout=dropout,
+        )
 
     def forward(self, x):
         mu, log_var = self.encoder(x)
         z = reparameterise(mu, log_var)
         logits = self.decoder(z, x)
         reg_pred = self.reg_predictor(mu)
+        ld50_pred = self.ld50_predictor(mu)
 
-        return logits, mu, log_var, reg_pred
+        return logits, mu, log_var, reg_pred, ld50_pred

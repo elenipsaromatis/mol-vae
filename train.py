@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
-from data import MAX_LENGTH, build_dataloaders
+from data import MAX_LENGTH, build_dataloaders_multitask
 from evaluate import evaluate, evaluate_regression, evaluate_test
 from model import VAE
 
@@ -55,6 +55,7 @@ def vae_loss(
     mu,
     log_var,
     reg_pred,
+    ld50_pred,
     labels,
     beta,
     gamma,
@@ -72,10 +73,11 @@ def vae_loss(
     kl_loss = torch.mean(torch.sum(kl_per_dim, dim=-1))
 
     reg_loss = nn.MSELoss()(reg_pred, labels[:, 0])
+    ld50_loss = nn.MSELoss()(ld50_pred, labels[:, 1])
 
-    loss = recon_loss + beta * kl_loss + gamma * reg_loss
+    loss = recon_loss + beta * kl_loss + gamma * (reg_loss + ld50_loss)
 
-    return loss, recon_loss, kl_loss, reg_loss
+    return loss, recon_loss, kl_loss, reg_loss, ld50_loss
 
 
 def evaluate_loss(
@@ -92,6 +94,7 @@ def evaluate_loss(
         "recon": 0.0,
         "kl": 0.0,
         "reg": 0.0,
+        "ld50": 0.0,
     }
 
     with torch.no_grad():
@@ -106,6 +109,7 @@ def evaluate_loss(
                 mu=outputs[1],
                 log_var=outputs[2],
                 reg_pred=outputs[3],
+                ld50_pred=outputs[4],
                 labels=labels,
                 beta=beta,
                 gamma=gamma,
@@ -142,7 +146,9 @@ def train():
         train_labels,
         reg_mean,
         reg_std,
-    ) = build_dataloaders(batch_size=BATCH_SIZE)
+        ld50_mean,
+        ld50_std,
+    ) = build_dataloaders_multitask(batch_size=BATCH_SIZE)
 
     MLFLOW_DIR = ROOT / "notebooks" / "mlruns"
     mlflow.set_tracking_uri(MLFLOW_DIR.resolve().as_uri())
@@ -163,7 +169,7 @@ def train():
 
     with mlflow.start_run() as run:
         run_id = run.info.run_id
-        run_name = f"vae_solubility_{run_id[:8]}"
+        run_name = f"vae_solubility_ld50_{run_id[:8]}"
         mlflow.set_tag("mlflow.runName", run_name)
 
         model_path = CHECKPOINT_DIR / f"{run_name}_final.pth"
@@ -186,8 +192,10 @@ def train():
                 "gamma": GAMMA,
                 "reg_mean": reg_mean.item(),
                 "reg_std": reg_std.item(),
-                "dataset": "Solubility_AqSolDB",
-                "split": "TDC Solubility scaffold",
+                "ld50_mean": ld50_mean.item(),
+                "ld50_std": ld50_std.item(),
+                "dataset": "Solubility_AqSolDB + LD50_Zhu",
+                "split": "TDC Solubility scaffold, LD50 inner-joined",
                 "scheduler": "CosineAnnealingLR",
             }
         )
@@ -222,6 +230,7 @@ def train():
                 "recon": 0.0,
                 "kl": 0.0,
                 "reg": 0.0,
+                "ld50": 0.0,
                 "grad": 0.0,
             }
 
@@ -242,6 +251,7 @@ def train():
                     mu=outputs[1],
                     log_var=outputs[2],
                     reg_pred=outputs[3],
+                    ld50_pred=outputs[4],
                     labels=labels,
                     beta=beta,
                     gamma=GAMMA,
@@ -255,7 +265,7 @@ def train():
                 optimizer.step()
 
                 for key, value in zip(
-                    ["loss", "recon", "kl", "reg"],
+                    ["loss", "recon", "kl", "reg", "ld50"],
                     loss_values,
                 ):
                     totals[key] += value.item()
@@ -274,6 +284,7 @@ def train():
                 valid_recon,
                 valid_kl,
                 valid_reg,
+                valid_ld50,
             ) = evaluate_loss(
                 model,
                 valid_loader,
@@ -284,10 +295,16 @@ def train():
             )
 
             valid_reg_metrics = evaluate_regression(
-                model, valid_loader, device, reg_mean, reg_std
+                model, valid_loader, device, reg_mean, reg_std, head="reg_predictor"
             )
             valid_rmse = valid_reg_metrics["rmse"]
             valid_mae = valid_reg_metrics["mae"]
+
+            valid_ld50_metrics = evaluate_regression(
+                model, valid_loader, device, ld50_mean, ld50_std, head="ld50_predictor"
+            )
+            valid_ld50_rmse = valid_ld50_metrics["rmse"]
+            valid_ld50_mae = valid_ld50_metrics["mae"]
 
             exact_acc, token_acc, validity = evaluate(
                 model,
@@ -304,12 +321,13 @@ def train():
                 f"Recon: {train_metrics['recon']:.4f}, "
                 f"KL: {train_metrics['kl']:.4f}, "
                 f"Reg: {train_metrics['reg']:.4f}, "
+                f"LD50: {train_metrics['ld50']:.4f}, "
                 f"LR: {current_lr:.1e}"
             )
             print(
                 f"         Valid loss: {valid_total:.4f}, "
-                f"RMSE: {valid_rmse:.4f}, "
-                f"MAE: {valid_mae:.4f}, "
+                f"Sol RMSE: {valid_rmse:.4f}, MAE: {valid_mae:.4f}, "
+                f"LD50 RMSE: {valid_ld50_rmse:.4f}, MAE: {valid_ld50_mae:.4f}, "
                 f"Recon acc: {exact_acc:.3f}, "
                 f"Token acc: {token_acc:.3f}, "
                 f"Validity: {validity:.3f}"
@@ -320,12 +338,16 @@ def train():
                 "train_recon": train_metrics["recon"],
                 "train_kl": train_metrics["kl"],
                 "train_reg_loss": train_metrics["reg"],
+                "train_ld50_loss": train_metrics["ld50"],
                 "valid_loss": valid_total,
                 "valid_recon": valid_recon,
                 "valid_kl": valid_kl,
                 "valid_reg_loss": valid_reg,
+                "valid_ld50_loss": valid_ld50,
                 "valid_rmse": valid_rmse,
                 "valid_mae": valid_mae,
+                "valid_ld50_rmse": valid_ld50_rmse,
+                "valid_ld50_mae": valid_ld50_mae,
                 "grad_norm": train_metrics["grad"],
                 "beta": beta,
                 "learning_rate": current_lr,
@@ -368,15 +390,16 @@ def train():
             eval_checkpoint = model_path
 
         test_metrics = evaluate_test(
-            model, test_loader, vocab_size, idx2char, device, reg_mean, reg_std
+            model, test_loader, vocab_size, idx2char, device,
+            reg_mean, reg_std, ld50_mean, ld50_std,
         )
 
         print(
             "\nTest: "
             f"Recon acc: {test_metrics['recon_acc']:.3f}, "
             f"Validity: {test_metrics['validity']:.3f}, "
-            f"RMSE: {test_metrics['rmse']:.3f}, "
-            f"MAE: {test_metrics['mae']:.3f}"
+            f"Sol RMSE: {test_metrics['rmse']:.3f}, MAE: {test_metrics['mae']:.3f}, "
+            f"LD50 RMSE: {test_metrics['ld50_rmse']:.3f}, MAE: {test_metrics['ld50_mae']:.3f}"
         )
         mlflow.log_metrics({f"test_{key}": value for key, value in test_metrics.items()})
 
