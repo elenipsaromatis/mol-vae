@@ -1,0 +1,14 @@
+[parameters]
+name = "vae-solubility-ld50-bo"
+seed = 11
+# Path to a trained checkpoint (checkpoints/*.pth), relative to repo root.
+checkpoint_path = "checkpoints/REPLACE_ME_best.pth"
+# NSGA2's convergence check (moocore's gd_common) crashes above ~32
+# dimensions (see bo/init.py:fit_pca) - stay well under that.
+pca_components = 25
+bounds_margin_frac = 0.1
+pop_size_per_dim = 20
+n_max_gen = 100
+n_select = 5
+minimize_solubility = false
+minimize_ld50 = false
