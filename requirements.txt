@@ -11,3 +11,4 @@ optuna-integration==4.9.0
 scikit-learn
 pytest
 tensorboard
+-e ../pfgs-optimization
