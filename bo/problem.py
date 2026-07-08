@@ -1,76 +1,103 @@
-"""paretodo BaseProblem: single-objective LD50 search over the VAE latent space."""
+"""Problem definition for BO of LD50 toxicity.
 
-from types import SimpleNamespace
+Loads a trained VAE checkpoint, encodes the overlap molecules into latent space,
+and returns LD50 labels for candidate selection BO. 
+"""
+
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
-import polars as pl
+import torch
+from torch.utils.data import DataLoader
 
-from paretodo import BaseProblem
+from data import build_dataloaders_multitask
+from model import VAE
 
 
-class MolecularLatentProblem(BaseProblem):
-    """Single-objective LD50 search over a PCA-compressed VAE latent space.
+@dataclass
+class BOProblem:
+    X: np.ndarray              # VAE latent embeddings, shape: (n_molecules, latent_dim)
+    y: np.ndarray              # standardised LD50 labels, shape: (n_molecules,)
+    y_raw: np.ndarray          # raw LD50 labels, shape: (n_molecules,)
+    ld50_mean: float
+    ld50_std: float
 
-    Solubility is only used as a training signal for the VAE (see train.py)
-    and is not searched over here. The search runs in the PCA subspace built
-    in bo/init.py:fit_pca (needed to avoid a moocore stack-overflow above
-    ~32 decision variables); the LD50 GP surrogate was fit directly in that
-    same PCA space, so predict() can query it without any VAE involvement.
+
+def get_device(device: str | None = None) -> torch.device:
+    if device is not None:
+        return torch.device(device)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def load_bo_problem(
+    checkpoint_path: str | Path,
+    batch_size: int = 64,
+    device: str | None = None,
+    ld50_col: int = 1,
+) -> BOProblem:
+    """Create the fixed candidate pool for BO.
+
+    Assumes build_dataloaders_multitask returns labels where:
+    labels[:, 0] = solubility
+    labels[:, 1] = LD50
     """
+    device = get_device(device)
+    checkpoint_path = Path(checkpoint_path)
 
-    def __init__(
-        self,
-        investigation_space,
-        optimization_problem,
-        ld50_gp,
-        samples_per_dimension=10,
-    ):
-        super().__init__(
-            investigation_space=investigation_space,
-            optimization_problem=optimization_problem,
-            samples_per_dimension=samples_per_dimension,
-        )
-        self.ld50_gp = ld50_gp
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    build = checkpoint["build"]
 
-    def _to_real_latent(self, x):
-        lower, upper = self.investigation_space.bounds
-        lower = np.asarray(lower, dtype=np.float64)
-        upper = np.asarray(upper, dtype=np.float64)
-        return lower + np.asarray(x, dtype=np.float64) * (upper - lower)
+    model = VAE(
+        vocab_size=build["vocab_size"],
+        seq_len=build["seq_len"],
+        hidden_dim=build["hidden_dim"],
+        latent_dim=build["latent_dim"],
+        n_layers=build["n_layers"],
+        dropout=build["dropout"],
+        prop_hidden_size=build["prop_hidden_size"],
+    ).to(device)
 
-    def predict(self, x, normalized=True):
-        z = self._to_real_latent(x)
-        ld50_mean_arr, ld50_sigma_arr = self.ld50_gp.predict(z, return_std=True)
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
 
-        predictions = SimpleNamespace(
-            x_data=z,
-            y_labels=["Y_ld50"],
-            y_data=ld50_mean_arr.reshape(-1, 1),
-            y_errors=ld50_sigma_arr.reshape(-1, 1),
-        )
+    train_loader, valid_loader, test_loader, *_rest = build_dataloaders_multitask(
+        batch_size=batch_size
+    )
 
-        columns = dict(zip(self.investigation_space.labels, z.T.tolist()))
-        columns["Y_ld50"] = ld50_mean_arr.tolist()
-        columns["Y_ld50_std"] = ld50_sigma_arr.tolist()
-        pred_df = pl.DataFrame(columns)
+    standardise = checkpoint["standardise"]
+    ld50_mean = float(standardise["ld50_mean"])
+    ld50_std = float(standardise["ld50_std"])
 
-        return predictions, pred_df
+    X_parts = []
+    y_parts = []
 
-    def create_objective_list(self, predictions, for_minimization=True):
-        objective_list = []
-        for axis in self.optimization_problem.problem:
-            idx = predictions.y_labels.index(axis.var_name)
-            objective_value = self._get_objective_value(
-                axis,
-                x_vals=predictions.x_data,
-                mean=predictions.y_data[:, idx],
-                sigma=predictions.y_errors[:, idx],
-                for_minimization=for_minimization,
-            )
-            objective_list.append(objective_value)
-        return objective_list
+    with torch.no_grad():
+        for old_loader in (train_loader, valid_loader, test_loader):
+            loader = DataLoader(old_loader.dataset, batch_size=batch_size, shuffle=False)
 
-    def prediction_to_robust_objective_values(self, predictions, opt_axis):
-        raise NotImplementedError(
-            "robustness optimization_type is not used by MolecularLatentProblem."
-        )
+            for batch, labels in loader:
+                batch = batch.to(device)
+                labels = labels.to(device)
+
+                outputs = model(batch)
+                mu = outputs[1]
+
+                X_parts.append(mu.cpu().numpy())
+                y_parts.append(labels[:, ld50_col].cpu().numpy())
+
+    X = np.vstack(X_parts).astype(np.float64)
+    y = np.concatenate(y_parts).astype(np.float64)
+    y_raw = y * ld50_std + ld50_mean
+
+    return BOProblem(
+        X=X,
+        y=y,
+        y_raw=y_raw,
+        ld50_mean=ld50_mean,
+        ld50_std=ld50_std,
+    )
