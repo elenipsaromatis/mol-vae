@@ -1,4 +1,4 @@
-"""Minimal candidate-selection Bayesian optimisation over VAE latent embeddings.
+"""Candidate selection Bayesian optimisation over VAE latent embeddings.
 
 Steps:
 1. Load VAE latent embeddings and LD50 labels.
@@ -6,17 +6,15 @@ Steps:
 3. Fit a GP on observed LD50 values.
 4. Predict mu and sigma for all molecules.
 5. Compute UCB.
-6. Plot all molecules on mu/sigma axes.
-7. Keep non-dominated unobserved candidates.
-8. Use ParetoSelector to pick the candidate closest to the utopia point.
-9. Add that selected candidate to the observed set.
-10. Repeat.
+6. Keep non-dominated unobserved candidates.
+7. Use ParetoSelector to pick the candidate closest to the utopia point.
+8. Add that selected candidate to the observed set.
+9. Repeat.
 """
 
 from pathlib import Path
 import argparse
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -143,74 +141,9 @@ def choose_next_candidate(candidate_indices, mu, sigma):
     return selected_index, pareto_global_indices
 
 
-def plot_mu_sigma(
-    path,
-    mu,
-    sigma,
-    ucb,
-    observed_indices,
-    pareto_indices,
-    selected_index,
-    iteration,
-):
-    """Plot all molecules on GP mu/sigma axes."""
-    all_indices = np.arange(len(mu))
-    unobserved_indices = np.setdiff1d(all_indices, observed_indices)
-
-    plt.figure(figsize=(8, 6))
-
-    scatter = plt.scatter(
-        mu[unobserved_indices],
-        sigma[unobserved_indices],
-        c=ucb[unobserved_indices],
-        s=20,
-        alpha=0.7,
-        label="unobserved",
-    )
-
-    plt.scatter(
-        mu[observed_indices],
-        sigma[observed_indices],
-        marker="x",
-        s=50,
-        label="observed",
-    )
-
-    plt.scatter(
-        mu[pareto_indices],
-        sigma[pareto_indices],
-        facecolors="none",
-        edgecolors="black",
-        s=70,
-        label="non-dominated",
-    )
-
-    plt.scatter(
-        mu[selected_index],
-        sigma[selected_index],
-        marker="*",
-        s=180,
-        label="selected",
-    )
-
-    plt.xlabel("GP posterior mean, mu")
-    plt.ylabel("GP posterior standard deviation, sigma")
-    plt.title(f"BO iteration {iteration}")
-    plt.colorbar(scatter, label="UCB = mu + kappa × sigma")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(path, dpi=200)
-    plt.close()
-
-
 def run_bo(args):
     out_dir = Path(args.out_dir)
-    plots_dir = out_dir / "plots"
-    predictions_dir = out_dir / "predictions"
-
     out_dir.mkdir(parents=True, exist_ok=True)
-    plots_dir.mkdir(exist_ok=True)
-    predictions_dir.mkdir(exist_ok=True)
 
     problem = load_bo_problem(
         checkpoint_path=args.checkpoint,
@@ -265,36 +198,6 @@ def run_bo(args):
             candidate_indices=candidate_indices,
             mu=mu,
             sigma=sigma,
-        )
-
-        plot_mu_sigma(
-            path=plots_dir / f"mu_sigma_iter_{iteration:03d}.png",
-            mu=mu,
-            sigma=sigma,
-            ucb=ucb,
-            observed_indices=observed_array,
-            pareto_indices=pareto_indices,
-            selected_index=selected_index,
-            iteration=iteration,
-        )
-
-        prediction_table = pd.DataFrame(
-            {
-                "index": all_indices,
-                "ld50_standardised_true": problem.y,
-                "ld50_raw_true": problem.y_raw,
-                "mu": mu,
-                "sigma": sigma,
-                "ucb": ucb,
-                "observed": np.isin(all_indices, observed_array),
-                "non_dominated": np.isin(all_indices, pareto_indices),
-                "selected": all_indices == selected_index,
-            }
-        )
-
-        prediction_table.to_csv(
-            predictions_dir / f"predictions_iter_{iteration:03d}.csv",
-            index=False,
         )
 
         history.append(
