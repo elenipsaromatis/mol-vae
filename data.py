@@ -47,9 +47,12 @@ def encode_smiles(smiles, char2idx, max_length):
 
 
 class SMILESDataset(Dataset):
-    def __init__(self, encoded_data, labels):
+    def __init__(self, encoded_data, labels, smiles=None):
         self.data = encoded_data
         self.labels = labels
+        # Raw canonical SMILES aligned to encoded_data by index.
+        # None for callers that do not need them (e.g. single-task loader).
+        self.smiles = smiles
 
     def __len__(self):
         return len(self.data)
@@ -136,9 +139,9 @@ def build_dataloaders(batch_size=64):
     for t in (train_labels, valid_labels, test_labels):
         t[:, 0] = (t[:, 0] - reg_mean) / reg_std
 
-    train_dataset = SMILESDataset(encoded_train, train_labels)
-    valid_dataset = SMILESDataset(encoded_valid, valid_labels)
-    test_dataset = SMILESDataset(encoded_test, test_labels)
+    train_dataset = SMILESDataset(encoded_train, train_labels, train_smiles)
+    valid_dataset = SMILESDataset(encoded_valid, valid_labels, valid_smiles)
+    test_dataset = SMILESDataset(encoded_test, test_labels, test_smiles)
 
     generator = torch.Generator()
     generator.manual_seed(42)
@@ -231,9 +234,9 @@ def build_dataloaders_multitask(batch_size=64):
         t[:, 0] = (t[:, 0] - sol_mean) / sol_std
         t[:, 1] = (t[:, 1] - ld50_mean) / ld50_std
 
-    train_dataset = SMILESDataset(encoded_train, train_labels)
-    valid_dataset = SMILESDataset(encoded_valid, valid_labels)
-    test_dataset = SMILESDataset(encoded_test, test_labels)
+    train_dataset = SMILESDataset(encoded_train, train_labels, train_smiles)
+    valid_dataset = SMILESDataset(encoded_valid, valid_labels, valid_smiles)
+    test_dataset = SMILESDataset(encoded_test, test_labels, test_smiles)
 
     generator = torch.Generator()
     generator.manual_seed(42)
