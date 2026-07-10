@@ -25,6 +25,9 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+import matplotlib
+import matplotlib.pyplot as plt
+
 import mlflow
 
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -37,7 +40,9 @@ from paretodo.selection.selector import ParetoSelector
 
 CHECKPOINT = Path("checkpoints/vae_solubility_70a6568a_best.pth")
 
-
+# Pareto-front objective column labels. Both objectives are maximised
+# (see non_dominated_indices). Under --objective minimize the GP target is
+# negated, so mu still maximises the sign-flipped LD50; the label stays max.
 OBJ_MU_COL = "obj:max(mu(LD50))"
 OBJ_SIGMA_COL = "obj:max(sigma(LD50))"
 
@@ -163,6 +168,77 @@ def select_via_pareto(candidate_indices, mu, sigma):
     return selected_index, pareto_global_indices
 
 
+def plot_pareto_front(
+    iteration,
+    candidate_indices,
+    pareto_indices,
+    selected_index,
+    mu,
+    sigma,
+    save_path,
+):
+    """Scatter of the objective space for this iteration.
+
+    x = mu(LD50), y = sigma(LD50), both maximised, so the utopia corner is
+    top-right. Unobserved candidates are grey, the non-dominated front is
+    highlighted and connected by a step line, and the selected point is starred.
+    """
+    fig, ax = plt.subplots(figsize=(6, 5))
+
+    # All unobserved candidates as background.
+    ax.scatter(
+        mu[candidate_indices],
+        sigma[candidate_indices],
+        s=12,
+        c="lightgrey",
+        label="candidates",
+        zorder=1,
+    )
+
+    # Non-dominated front, sorted by mu for a clean staircase.
+    order = np.argsort(mu[pareto_indices])
+    front = pareto_indices[order]
+    ax.plot(
+        mu[front],
+        sigma[front],
+        color="tab:blue",
+        linewidth=1.0,
+        alpha=0.6,
+        zorder=2,
+    )
+    ax.scatter(
+        mu[front],
+        sigma[front],
+        s=40,
+        c="tab:blue",
+        edgecolors="black",
+        linewidths=0.4,
+        label="pareto front",
+        zorder=3,
+    )
+
+    # Selected recipe.
+    ax.scatter(
+        mu[selected_index],
+        sigma[selected_index],
+        s=220,
+        marker="*",
+        c="tab:red",
+        edgecolors="black",
+        linewidths=0.6,
+        label="selected",
+        zorder=4,
+    )
+
+    ax.set_xlabel("obj:max(mu(LD50))")
+    ax.set_ylabel("obj:max(sigma(LD50))")
+    ax.set_title(f"Pareto front, iteration {iteration:02d}")
+    ax.legend(loc="lower left", fontsize=8, framealpha=0.9)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
 def log_iteration_artifacts(
     iteration,
     all_indices,
@@ -221,14 +297,58 @@ def log_iteration_artifacts(
         exp_path = os.path.join(tmp, "experiments.csv")
         pf_path = os.path.join(tmp, "pareto_front.csv")
         sel_path = os.path.join(tmp, "selected_recipes.csv")
+        plot_path = os.path.join(tmp, "pareto_front.png")
 
         experiments.to_csv(exp_path, index=False)
         pareto_front.to_csv(pf_path, index=False)
         selected.to_csv(sel_path, index=False)
 
+        plot_pareto_front(
+            iteration=iteration,
+            candidate_indices=candidate_indices,
+            pareto_indices=pareto_indices,
+            selected_index=selected_index,
+            mu=mu,
+            sigma=sigma,
+            save_path=plot_path,
+        )
+
         mlflow.log_artifact(exp_path, artifact_path=folder)
         mlflow.log_artifact(pf_path, artifact_path=folder)
         mlflow.log_artifact(sel_path, artifact_path=folder)
+        mlflow.log_artifact(plot_path, artifact_path=folder)
+
+
+def plot_convergence(history, save_path):
+    """Selected LD50 (raw) per iteration, with a running best line."""
+    iters = [h["iteration"] for h in history]
+    ld50 = np.array([h["selected_ld50_raw"] for h in history], dtype=float)
+    running_best = np.maximum.accumulate(ld50)
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(
+        iters,
+        ld50,
+        marker="o",
+        markersize=4,
+        linewidth=1.0,
+        color="tab:grey",
+        label="selected LD50",
+    )
+    ax.plot(
+        iters,
+        running_best,
+        linewidth=2.0,
+        color="tab:red",
+        label="running best",
+    )
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("LD50 (raw)")
+    ax.set_title("BO convergence")
+    ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
 
 
 def run_bo(args):
@@ -283,7 +403,7 @@ def run_bo(args):
             }
         )
 
-        # Log the exact VAE checkpoint used, so the model is traceable
+        # Log the exact VAE checkpoint used, so the model is traceable.
         mlflow.log_artifact(str(args.checkpoint), artifact_path="vae_checkpoint")
 
         for iteration in range(args.n_iterations):
@@ -369,6 +489,12 @@ def run_bo(args):
             np.save(out_dir / "observed_indices.npy", np.array(observed_indices))
 
         mlflow.log_artifact(str(out_dir / "bo_trace.csv"))
+
+        # Run-level convergence plot across all iterations.
+        with tempfile.TemporaryDirectory() as tmp:
+            conv_path = os.path.join(tmp, "convergence.png")
+            plot_convergence(history, conv_path)
+            mlflow.log_artifact(conv_path)
 
     return pd.DataFrame(history)
 
