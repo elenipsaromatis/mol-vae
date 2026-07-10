@@ -2,22 +2,30 @@
 
 Steps:
 1. Load VAE latent embeddings and LD50 labels.
-2. Randomly observe 20 molecules.
+2. Randomly observe 100 molecules.
 3. Fit a GP on observed LD50 values.
 4. Predict mu and sigma for all molecules.
 5. Compute UCB.
 6. Keep non-dominated unobserved candidates.
-7. Use ParetoSelector to pick the candidate closest to the utopia point.
+7. Select the next candidate (UCB argmax, or ParetoSelector utopia distance).
 8. Add that selected candidate to the observed set.
 9. Repeat.
+
+Each iteration logs three CSVs into its own MLflow artifact folder
+(iteration_00, iteration_01, ...): experiments, pareto front, selected recipes.
+The VAE checkpoint used for the run is logged as a run-level artifact.
 """
 
 from pathlib import Path
 import argparse
+import os
+import tempfile
 
 import numpy as np
 import pandas as pd
 import polars as pl
+
+import mlflow
 
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel
@@ -28,6 +36,11 @@ from paretodo.selection.selector import ParetoSelector
 
 
 CHECKPOINT = Path("checkpoints/vae_solubility_70a6568a_best.pth")
+
+
+OBJ_MU_COL = "obj:max(mu(LD50))"
+OBJ_SIGMA_COL = "obj:max(sigma(LD50))"
+
 
 def fit_gp(X_observed, y_observed, seed):
     """Fit a Gaussian process on the currently observed molecules."""
@@ -84,21 +97,30 @@ def non_dominated_indices(points):
     return np.array(keep, dtype=int)
 
 
-def choose_next_candidate(candidate_indices, mu, sigma):
-    """Choose the next molecule using ParetoSelector.
-
-    candidate_indices are the global indices of molecules that have not yet
-    been observed.
-    """
+def compute_pareto_indices(candidate_indices, mu, sigma):
+    """Global indices of the non-dominated unobserved candidates."""
     points = np.column_stack(
         [
             mu[candidate_indices],
             sigma[candidate_indices],
         ]
     )
-
     pareto_local_indices = non_dominated_indices(points)
-    pareto_global_indices = candidate_indices[pareto_local_indices]
+    return candidate_indices[pareto_local_indices]
+
+
+def select_via_ucb(candidate_indices, ucb):
+    """Pick the unobserved candidate with the highest UCB."""
+    best_local = int(np.argmax(ucb[candidate_indices]))
+    return int(candidate_indices[best_local])
+
+
+def select_via_pareto(candidate_indices, mu, sigma):
+    """Pick the front point closest to the utopia point via ParetoSelector.
+
+    Returns the selected global index and the non-dominated global indices.
+    """
+    pareto_global_indices = compute_pareto_indices(candidate_indices, mu, sigma)
 
     pareto_front = pl.DataFrame(
         {
@@ -141,6 +163,74 @@ def choose_next_candidate(candidate_indices, mu, sigma):
     return selected_index, pareto_global_indices
 
 
+def log_iteration_artifacts(
+    iteration,
+    all_indices,
+    candidate_indices,
+    observed_array,
+    pareto_indices,
+    selected_index,
+    problem,
+    mu,
+    sigma,
+    ucb,
+    selection_method,
+):
+    """Write experiments / pareto front / selected recipes for this iteration
+    and log them into a dedicated MLflow artifact folder."""
+    smiles = problem.smiles
+
+    experiments = pd.DataFrame(
+        {
+            "RecipeID": all_indices,
+            "SMILES": smiles,
+            "mu": mu,
+            "sigma": sigma,
+            "ucb": ucb,
+            "observed": np.isin(all_indices, observed_array),
+        }
+    )
+
+    pareto_front = pd.DataFrame(
+        {
+            "RecipeID": pareto_indices,
+            "SMILES": smiles[pareto_indices],
+            OBJ_MU_COL: mu[pareto_indices],
+            OBJ_SIGMA_COL: sigma[pareto_indices],
+        }
+    )
+
+    selected = pd.DataFrame(
+        [
+            {
+                "RecipeID": int(selected_index),
+                "SMILES": str(smiles[selected_index]),
+                "mu": float(mu[selected_index]),
+                "sigma": float(sigma[selected_index]),
+                "ucb": float(ucb[selected_index]),
+                "ld50_raw": float(problem.y_raw[selected_index]),
+                "ld50_standardised": float(problem.y[selected_index]),
+                "selection_method": selection_method,
+            }
+        ]
+    )
+
+    folder = f"iteration_{iteration:02d}"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        exp_path = os.path.join(tmp, "experiments.csv")
+        pf_path = os.path.join(tmp, "pareto_front.csv")
+        sel_path = os.path.join(tmp, "selected_recipes.csv")
+
+        experiments.to_csv(exp_path, index=False)
+        pareto_front.to_csv(pf_path, index=False)
+        selected.to_csv(sel_path, index=False)
+
+        mlflow.log_artifact(exp_path, artifact_path=folder)
+        mlflow.log_artifact(pf_path, artifact_path=folder)
+        mlflow.log_artifact(sel_path, artifact_path=folder)
+
+
 def run_bo(args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -164,6 +254,7 @@ def run_bo(args):
     X_scaled = scaler.fit_transform(X)
 
     n_candidates = X_scaled.shape[0]
+    all_indices = np.arange(n_candidates)
 
     rng = np.random.default_rng(args.seed)
 
@@ -175,59 +266,109 @@ def run_bo(args):
 
     history = []
 
-    for iteration in range(args.n_iterations):
-        observed_array = np.array(observed_indices, dtype=int)
+    mlflow.set_experiment(args.experiment_name)
 
-        X_observed = X_scaled[observed_array]
-        y_observed = y_for_gp[observed_array]
-
-        gp = fit_gp(
-            X_observed=X_observed,
-            y_observed=y_observed,
-            seed=args.seed + iteration,
-        )
-
-        mu, sigma = gp.predict(X_scaled, return_std=True)
-
-        ucb = mu + args.kappa * sigma
-
-        all_indices = np.arange(n_candidates)
-        candidate_indices = np.setdiff1d(all_indices, observed_array)
-
-        selected_index, pareto_indices = choose_next_candidate(
-            candidate_indices=candidate_indices,
-            mu=mu,
-            sigma=sigma,
-        )
-
-        history.append(
+    with mlflow.start_run(run_name=args.run_name):
+        mlflow.log_params(
             {
-                "iteration": iteration,
-                "n_observed_before": len(observed_indices),
-                "selected_index": int(selected_index),
-                "selected_ld50_standardised": float(problem.y[selected_index]),
-                "selected_ld50_raw": float(problem.y_raw[selected_index]),
-                "selected_mu": float(mu[selected_index]),
-                "selected_sigma": float(sigma[selected_index]),
-                "selected_ucb": float(ucb[selected_index]),
-                "n_non_dominated": int(len(pareto_indices)),
+                "checkpoint": str(args.checkpoint),
+                "n_initial": args.n_initial,
+                "n_iterations": args.n_iterations,
+                "kappa": args.kappa,
+                "seed": args.seed,
+                "objective": args.objective,
+                "selection": args.selection,
+                "n_candidates": n_candidates,
+                "latent_dim": int(X.shape[1]),
             }
         )
 
-        print(
-            f"iteration {iteration:03d} | "
-            f"observed = {len(observed_indices)} | "
-            f"selected = {selected_index} | "
-            f"LD50 raw = {problem.y_raw[selected_index]:.4f} | "
-            f"mu = {mu[selected_index]:.4f} | "
-            f"sigma = {sigma[selected_index]:.4f} | "
-            f"UCB = {ucb[selected_index]:.4f}"
-        )
+        # Log the exact VAE checkpoint used, so the model is traceable
+        mlflow.log_artifact(str(args.checkpoint), artifact_path="vae_checkpoint")
 
-        observed_indices.append(int(selected_index))
+        for iteration in range(args.n_iterations):
+            observed_array = np.array(observed_indices, dtype=int)
 
-        pd.DataFrame(history).to_csv(out_dir / "bo_trace.csv", index=False)
-        np.save(out_dir / "observed_indices.npy", np.array(observed_indices))
+            X_observed = X_scaled[observed_array]
+            y_observed = y_for_gp[observed_array]
+
+            gp = fit_gp(
+                X_observed=X_observed,
+                y_observed=y_observed,
+                seed=args.seed + iteration,
+            )
+
+            mu, sigma = gp.predict(X_scaled, return_std=True)
+
+            ucb = mu + args.kappa * sigma
+
+            candidate_indices = np.setdiff1d(all_indices, observed_array)
+
+            if args.selection == "ucb":
+                selected_index = select_via_ucb(candidate_indices, ucb)
+                pareto_indices = compute_pareto_indices(
+                    candidate_indices, mu, sigma
+                )
+            else:
+                selected_index, pareto_indices = select_via_pareto(
+                    candidate_indices, mu, sigma
+                )
+
+            log_iteration_artifacts(
+                iteration=iteration,
+                all_indices=all_indices,
+                candidate_indices=candidate_indices,
+                observed_array=observed_array,
+                pareto_indices=pareto_indices,
+                selected_index=selected_index,
+                problem=problem,
+                mu=mu,
+                sigma=sigma,
+                ucb=ucb,
+                selection_method=args.selection,
+            )
+
+            history.append(
+                {
+                    "iteration": iteration,
+                    "n_observed_before": len(observed_indices),
+                    "selected_index": int(selected_index),
+                    "selected_ld50_standardised": float(problem.y[selected_index]),
+                    "selected_ld50_raw": float(problem.y_raw[selected_index]),
+                    "selected_mu": float(mu[selected_index]),
+                    "selected_sigma": float(sigma[selected_index]),
+                    "selected_ucb": float(ucb[selected_index]),
+                    "n_non_dominated": int(len(pareto_indices)),
+                }
+            )
+
+            mlflow.log_metrics(
+                {
+                    "selected_ld50_raw": float(problem.y_raw[selected_index]),
+                    "selected_mu": float(mu[selected_index]),
+                    "selected_sigma": float(sigma[selected_index]),
+                    "selected_ucb": float(ucb[selected_index]),
+                    "n_non_dominated": int(len(pareto_indices)),
+                },
+                step=iteration,
+            )
+
+            print(
+                f"iteration {iteration:03d} | "
+                f"observed = {len(observed_indices)} | "
+                f"selected = {selected_index} | "
+                f"LD50 raw = {problem.y_raw[selected_index]:.4f} | "
+                f"mu = {mu[selected_index]:.4f} | "
+                f"sigma = {sigma[selected_index]:.4f} | "
+                f"UCB = {ucb[selected_index]:.4f}"
+            )
+
+            observed_indices.append(int(selected_index))
+
+            pd.DataFrame(history).to_csv(out_dir / "bo_trace.csv", index=False)
+            np.save(out_dir / "observed_indices.npy", np.array(observed_indices))
+
+        mlflow.log_artifact(str(out_dir / "bo_trace.csv"))
 
     return pd.DataFrame(history)
 
@@ -253,6 +394,16 @@ def build_parser():
         choices=["maximize", "minimize"],
         default="maximize",
     )
+
+    parser.add_argument(
+        "--selection",
+        choices=["pareto", "ucb"],
+        default="pareto",
+        help="pareto: ParetoSelector utopia distance. ucb: argmax UCB.",
+    )
+
+    parser.add_argument("--experiment-name", default="bo-ld50")
+    parser.add_argument("--run-name", default=None)
 
     return parser
 
