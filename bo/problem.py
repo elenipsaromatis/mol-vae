@@ -1,7 +1,7 @@
 """Problem definition for BO of LD50 toxicity.
 
 Loads a trained VAE checkpoint, encodes the overlap molecules into latent space,
-and returns LD50 labels for candidate selection BO. 
+and returns LD50 labels for candidate selection BO.
 """
 
 from dataclasses import dataclass
@@ -20,6 +20,7 @@ class BOProblem:
     X: np.ndarray              # VAE latent embeddings, shape: (n_molecules, latent_dim)
     y: np.ndarray              # standardised LD50 labels, shape: (n_molecules,)
     y_raw: np.ndarray          # raw LD50 labels, shape: (n_molecules,)
+    smiles: np.ndarray         # canonical SMILES, dtype object, shape: (n_molecules,)
     ld50_mean: float
     ld50_std: float
 
@@ -75,9 +76,12 @@ def load_bo_problem(
 
     X_parts = []
     y_parts = []
+    smiles_parts = []
 
     with torch.no_grad():
         for old_loader in (train_loader, valid_loader, test_loader):
+            smiles_parts.extend(list(old_loader.dataset.smiles))
+
             loader = DataLoader(old_loader.dataset, batch_size=batch_size, shuffle=False)
 
             for batch, labels in loader:
@@ -93,11 +97,17 @@ def load_bo_problem(
     X = np.vstack(X_parts).astype(np.float64)
     y = np.concatenate(y_parts).astype(np.float64)
     y_raw = y * ld50_std + ld50_mean
+    smiles = np.array(smiles_parts, dtype=object)
+
+    assert smiles.shape[0] == X.shape[0], (
+        f"SMILES ({smiles.shape[0]}) and X ({X.shape[0]}) are misaligned"
+    )
 
     return BOProblem(
         X=X,
         y=y,
         y_raw=y_raw,
+        smiles=smiles,
         ld50_mean=ld50_mean,
         ld50_std=ld50_std,
     )
