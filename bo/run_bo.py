@@ -24,7 +24,7 @@ import pandas as pd
 import polars as pl
 
 import matplotlib
-matplotlib.use("Agg")  # headless: save figures without a display
+matplotlib.use("Agg") 
 import matplotlib.pyplot as plt
 
 import mlflow
