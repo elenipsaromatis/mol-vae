@@ -15,4 +15,4 @@ notebooks/mlruns/
 *.pyc
 .venv/
 optuna_study.log
-best_params.json
+best_params.json.temp/
