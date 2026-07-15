@@ -16,3 +16,4 @@ notebooks/mlruns/
 .venv/
 optuna_study.log
 best_params.json.temp/
+.temp/
