@@ -11,9 +11,7 @@ Steps:
 8. Add that selected candidate to the observed set.
 9. Repeat.
 
-Each iteration logs three CSVs into its own MLflow artifact folder
-(iteration_00, iteration_01, ...): experiments, pareto front, selected recipes.
-The VAE checkpoint used for the run is logged as a run-level artifact.
+Each iteration logs three CSVs into its own MLflow artifact folder: experiments, pareto front, selected recipes.
 """
 
 from pathlib import Path
@@ -26,6 +24,7 @@ import pandas as pd
 import polars as pl
 
 import matplotlib
+matplotlib.use("Agg")  # headless: save figures without a display
 import matplotlib.pyplot as plt
 
 import mlflow
@@ -35,16 +34,15 @@ from sklearn.gaussian_process.kernels import Matern, WhiteKernel
 from sklearn.preprocessing import StandardScaler
 
 from bo.problem import load_bo_problem
+from bo.dashboard_artifacts import log_dashboard_general
 from paretodo.selection.selector import ParetoSelector
 
 
 CHECKPOINT = Path("checkpoints/vae_solubility_70a6568a_best.pth")
 
-# Pareto-front objective column labels. Both objectives are maximised
-# (see non_dominated_indices). Under --objective minimize the GP target is
-# negated, so mu still maximises the sign-flipped LD50; the label stays max.
-OBJ_MU_COL = "obj:max(mu(LD50))"
-OBJ_SIGMA_COL = "obj:max(sigma(LD50))"
+
+OBJ_MU_COL = "obj:max(\u03bc(LD50))"      # obj:max(mu(LD50))
+OBJ_SIGMA_COL = "obj:max(\u03c3(LD50))"   # obj:max(sigma(LD50))
 
 
 def fit_gp(X_observed, y_observed, seed):
@@ -181,11 +179,11 @@ def plot_pareto_front(
 
     x = mu(LD50), y = sigma(LD50), both maximised, so the utopia corner is
     top-right. Unobserved candidates are grey, the non-dominated front is
-    highlighted and connected by a step line, and the selected point is starred.
+    highlighted, and the selected point is starred.
     """
     fig, ax = plt.subplots(figsize=(6, 5))
 
-    # All unobserved candidates as background.
+    # unobserved candidates
     ax.scatter(
         mu[candidate_indices],
         sigma[candidate_indices],
@@ -195,7 +193,7 @@ def plot_pareto_front(
         zorder=1,
     )
 
-    # Non-dominated front, sorted by mu for a clean staircase.
+    # Non-dominated front
     order = np.argsort(mu[pareto_indices])
     front = pareto_indices[order]
     ax.plot(
@@ -217,7 +215,7 @@ def plot_pareto_front(
         zorder=3,
     )
 
-    # Selected recipe.
+    # Selected recipe
     ax.scatter(
         mu[selected_index],
         sigma[selected_index],
@@ -252,18 +250,15 @@ def log_iteration_artifacts(
     ucb,
     selection_method,
 ):
-    """Write experiments / pareto front / selected recipes for this iteration
+    """Write experiments/pareto front/selected recipes for this iteration
     and log them into a dedicated MLflow artifact folder."""
     smiles = problem.smiles
 
     experiments = pd.DataFrame(
         {
-            "RecipeID": all_indices,
-            "SMILES": smiles,
-            "mu": mu,
-            "sigma": sigma,
-            "ucb": ucb,
-            "observed": np.isin(all_indices, observed_array),
+            "RecipeID": observed_array,
+            "SMILES": smiles[observed_array],
+            "LD50": problem.y_raw[observed_array],
         }
     )
 
@@ -291,16 +286,19 @@ def log_iteration_artifacts(
         ]
     )
 
-    folder = f"iteration_{iteration:02d}"
+    folder = f"Iteration_{iteration:02d}"
 
     with tempfile.TemporaryDirectory() as tmp:
         exp_path = os.path.join(tmp, "experiments.csv")
         pf_path = os.path.join(tmp, "pareto_front.csv")
+        pf_pred_path = os.path.join(tmp, "pareto_front_predictions.csv")
         sel_path = os.path.join(tmp, "selected_recipes.csv")
         plot_path = os.path.join(tmp, "pareto_front.png")
 
         experiments.to_csv(exp_path, index=False)
         pareto_front.to_csv(pf_path, index=False)
+        # Same content under the name the paretodo dashboard reads.
+        pareto_front.to_csv(pf_pred_path, index=False)
         selected.to_csv(sel_path, index=False)
 
         plot_pareto_front(
@@ -315,6 +313,7 @@ def log_iteration_artifacts(
 
         mlflow.log_artifact(exp_path, artifact_path=folder)
         mlflow.log_artifact(pf_path, artifact_path=folder)
+        mlflow.log_artifact(pf_pred_path, artifact_path=folder)
         mlflow.log_artifact(sel_path, artifact_path=folder)
         mlflow.log_artifact(plot_path, artifact_path=folder)
 
@@ -345,6 +344,7 @@ def plot_convergence(history, save_path):
     ax.set_xlabel("iteration")
     ax.set_ylabel("LD50 (raw)")
     ax.set_title("BO convergence")
+    ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
     ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
@@ -400,11 +400,17 @@ def run_bo(args):
                 "selection": args.selection,
                 "n_candidates": n_candidates,
                 "latent_dim": int(X.shape[1]),
+                "mode": args.mode,
             }
         )
 
-        # Log the exact VAE checkpoint used, so the model is traceable.
+        # Always log the mode tag so the dashboard can react
+        mlflow.set_tag("mode", args.mode)
+
+        # Log the exact VAE checkpoint used
         mlflow.log_artifact(str(args.checkpoint), artifact_path="vae_checkpoint")
+
+        log_dashboard_general(problem)
 
         for iteration in range(args.n_iterations):
             observed_array = np.array(observed_indices, dtype=int)
@@ -530,6 +536,24 @@ def build_parser():
 
     parser.add_argument("--experiment-name", default="bo-ld50")
     parser.add_argument("--run-name", default=None)
+
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--default",
+        dest="mode",
+        action="store_const",
+        const="default",
+        help="Default mode: dashboard shows all sections.",
+    )
+    mode_group.add_argument(
+        "--candidate-selection",
+        dest="mode",
+        action="store_const",
+        const="candidate_selection",
+        help="Candidate-selection mode: dashboard hides GP Predictions and "
+        "Investigation Space Visualization.",
+    )
+    parser.set_defaults(mode="default")
 
     return parser
 
