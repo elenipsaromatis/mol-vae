@@ -43,8 +43,9 @@ def evaluate(model, dataset, vocab_size, device, idx2char, n_samples=500):
         pred_tokens = logits.argmax(dim=-1)
 
     targets = batch[:, 1:]
-    exact_acc = (pred_tokens == targets).all(dim=1).float().mean().item()
     mask = targets != 0
+    correct = (pred_tokens == targets) | ~mask
+    exact_acc = correct.all(dim=1).float().mean().item()
     token_acc = (pred_tokens[mask] == targets[mask]).float().mean().item()
 
     valid_count = 0
@@ -98,7 +99,9 @@ def evaluate_test(
     all_logits = torch.cat(all_logits, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
     pred_tokens = all_logits.argmax(dim=-1)
-    recon_acc = (pred_tokens == all_targets).all(dim=1).float().mean().item()
+    mask = all_targets != 0
+    correct = (pred_tokens == all_targets) | ~mask
+    recon_acc = correct.all(dim=1).float().mean().item()
 
     valid_count = 0
     for seq in pred_tokens:
