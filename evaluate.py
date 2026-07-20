@@ -1,6 +1,20 @@
 import torch
 from rdkit import Chem
 
+def tokens_to_smiles(seq, idx2char):
+    chars = [idx2char[idx.item()] for idx in seq]
+    smiles = ''
+    for ch in chars:
+        if ch == '<eos>':
+            break
+        if ch not in ['<pad>', '<sos>']:
+            smiles += ch
+    return smiles
+
+
+def canon(s):
+    m = Chem.MolFromSmiles(s) if s else None
+    return Chem.MolToSmiles(m) if m else None
 
 def _collect_regression(model, loader, device, head="reg_predictor", label_idx=0):
     """Return (labels, preds) tensors for the given regression head. Predictor reads mu"""
@@ -104,17 +118,16 @@ def evaluate_test(
     recon_acc = correct.all(dim=1).float().mean().item()
 
     valid_count = 0
-    for seq in pred_tokens:
-        chars = [idx2char[idx.item()] for idx in seq]
-        smiles = ''
-        for ch in chars:
-            if ch == '<eos>':
-                break
-            if ch not in ['<pad>', '<sos>']:
-                smiles += ch
-        if smiles and Chem.MolFromSmiles(smiles) is not None:
+    canon_match = 0
+    for pred_seq, tgt_seq in zip(pred_tokens, all_targets):
+        cp = canon(tokens_to_smiles(pred_seq, idx2char))
+        if cp is not None:
             valid_count += 1
-    validity = valid_count / len(pred_tokens)
+            if cp == canon(tokens_to_smiles(tgt_seq, idx2char)):
+                canon_match += 1
+    n = len(pred_tokens)
+    validity = valid_count / n
+    canonical_acc = canon_match / n
 
     reg_preds = torch.cat(reg_preds)
     reg_labels = torch.cat(reg_labels)
@@ -138,6 +151,7 @@ def evaluate_test(
 
     return {
         "recon_acc": recon_acc,
+        "canonical_acc": canonical_acc,
         "validity": validity,
         "rmse": rmse,
         "mae": mae,
