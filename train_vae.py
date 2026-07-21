@@ -1,10 +1,14 @@
-"""VAE trained on the Solubility x LD50 overlap.
+"""VAE trained on the Solubility x LD50 overlap for BO on LD50.
 
-Reconstruction, KL, and a solubility head train on the overlap molecules.
+Trains reconstruction, KL, and a solubility head on the overlap molecules.
 LD50 is not a training target. Its labels and standardisation stats ride
-along in the loader and checkpoint so the BO stage can fit a GP on LD50
-over the latent z of these same molecules.
+along in the loader and checkpoint so the downstream BO stage can fit a GP
+on LD50 over the latent z of these same molecules.
 
+The VAE still builds an ld50_predictor head, but it receives no supervised
+gradient here and stays untrained. BO reads LD50 from its own GP, not from
+that head. Any LD50 metrics printed by evaluate_test come from the untrained
+head and are not meaningful.
 """
 
 import random

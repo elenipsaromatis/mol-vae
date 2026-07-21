@@ -1,3 +1,15 @@
+"""VAE trained on the Solubility x LD50 overlap with both properties supervised.
+
+Trains reconstruction, KL, a solubility head, and an LD50 head jointly on the
+overlap molecules. Both property losses enter the objective through
+gamma * (reg_loss + ld50_loss).
+
+LD50 labels and standardisation stats are used directly as training targets
+here, unlike train_vae.py, which reserves LD50 for a downstream BO stage. Use
+this file when you want the model to predict LD50 from z directly rather than
+fitting a separate GP.
+"""
+
 import random
 from pathlib import Path
 import mlflow
