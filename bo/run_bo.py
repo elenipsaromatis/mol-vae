@@ -286,6 +286,40 @@ def log_iteration_artifacts(
         ]
     )
 
+    # Save predictions and statuses for every molecule
+    all_predictions = pd.DataFrame(
+        {
+            "RecipeID": all_indices,
+            "SMILES": smiles[all_indices],
+            "LD50_raw": problem.y_raw[all_indices],
+            "LD50_standardised": problem.y[all_indices],
+            "mu": mu[all_indices],
+            "sigma": sigma[all_indices],
+            "ucb": ucb[all_indices],
+            "observed": np.isin(all_indices, observed_array),
+            "candidate": np.isin(all_indices, candidate_indices),
+            "is_pareto": np.isin(all_indices, pareto_indices),
+            "is_selected": all_indices == selected_index,
+        }
+    )
+
+    # Rank candidates by acquisition score and true LD50
+    all_predictions["ucb_rank"] = (
+        all_predictions["ucb"]
+        .rank(method="min", ascending=False)
+        .astype(int)
+    )
+
+    all_predictions["true_ld50_rank"] = (
+        all_predictions["LD50_raw"]
+        .rank(method="min", ascending=False)
+        .astype(int)
+    )
+
+    all_predictions["is_true_top_10"] = (
+        all_predictions["true_ld50_rank"] <= 10
+    )
+
     folder = f"Iteration_{iteration:02d}"
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -293,13 +327,17 @@ def log_iteration_artifacts(
         pf_path = os.path.join(tmp, "pareto_front.csv")
         pf_pred_path = os.path.join(tmp, "pareto_front_predictions.csv")
         sel_path = os.path.join(tmp, "selected_recipes.csv")
+        all_pred_path = os.path.join(tmp, "all_candidate_predictions.csv")
         plot_path = os.path.join(tmp, "pareto_front.png")
 
         experiments.to_csv(exp_path, index=False)
         pareto_front.to_csv(pf_path, index=False)
+
         # Same content under the name the paretodo dashboard reads.
         pareto_front.to_csv(pf_pred_path, index=False)
+
         selected.to_csv(sel_path, index=False)
+        all_predictions.to_csv(all_pred_path, index=False)
 
         plot_pareto_front(
             iteration=iteration,
@@ -315,6 +353,7 @@ def log_iteration_artifacts(
         mlflow.log_artifact(pf_path, artifact_path=folder)
         mlflow.log_artifact(pf_pred_path, artifact_path=folder)
         mlflow.log_artifact(sel_path, artifact_path=folder)
+        mlflow.log_artifact(all_pred_path, artifact_path=folder)
         mlflow.log_artifact(plot_path, artifact_path=folder)
 
 
@@ -457,6 +496,8 @@ def run_bo(args):
             history.append(
                 {
                     "iteration": iteration,
+                    "selected_recipe_id": int(selected_index),
+                    "selected_smiles": str(problem.smiles[selected_index]),
                     "n_observed_before": len(observed_indices),
                     "selected_index": int(selected_index),
                     "selected_ld50_standardised": float(problem.y[selected_index]),
@@ -464,6 +505,21 @@ def run_bo(args):
                     "selected_mu": float(mu[selected_index]),
                     "selected_sigma": float(sigma[selected_index]),
                     "selected_ucb": float(ucb[selected_index]),
+                    "selected_ucb_rank": int(
+                        pd.Series(ucb)
+                        .rank(method="min", ascending=False)
+                        .iloc[selected_index]
+                    ),
+                    "selected_true_ld50_rank": int(
+                        pd.Series(problem.y_raw)
+                        .rank(method="min", ascending=False)
+                        .iloc[selected_index]
+                    ),
+                    "selected_is_true_top_10": bool(
+                        pd.Series(problem.y_raw)
+                        .rank(method="min", ascending=False)
+                        .iloc[selected_index] <= 10
+                    ),
                     "n_non_dominated": int(len(pareto_indices)),
                 }
             )
@@ -514,7 +570,7 @@ def build_parser():
     parser.add_argument("--n-initial", type=int, default=100)
     parser.add_argument("--n-iterations", type=int, default=20)
 
-    parser.add_argument("--kappa", type=float, default=2.0)
+    parser.add_argument("--kappa", type=float, default=1.96)
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--batch-size", type=int, default=64)
