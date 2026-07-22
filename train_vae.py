@@ -242,20 +242,25 @@ def train():
             reg_metrics = evaluate_regression(
                 model, valid_loader, device, reg_mean, reg_std, head="reg_predictor"
             )
-            exact_acc, token_acc, validity = evaluate(
+            train_exact_acc, train_token_acc, train_validity = evaluate(
                 model, train_loader.dataset, vocab_size, device, idx2char
+            )
+            valid_exact_acc, valid_token_acc, valid_validity = evaluate(
+                model, valid_loader.dataset, vocab_size, device, idx2char
             )
             lr = optimizer.param_groups[0]["lr"]
 
             print(
                 f"Epoch {epoch + 1:>2}/{EPOCHS}, beta: {beta:.4f}, "
                 f"Loss: {train_metrics['loss']:.4f}, Recon: {train_metrics['recon']:.4f}, "
-                f"KL: {train_metrics['kl']:.4f}, Reg: {train_metrics['reg']:.4f}, LR: {lr:.1e}"
+                f"KL: {train_metrics['kl']:.4f}, Reg: {train_metrics['reg']:.4f}, "
+                f"Recon acc: {train_exact_acc:.3f}, Token acc: {train_token_acc:.3f}, "
+                f"Validity: {train_validity:.3f}, LR: {lr:.1e}"
             )
             print(
                 f"         Valid loss: {valid_total:.4f}, Sol RMSE: {reg_metrics['rmse']:.4f}, "
-                f"MAE: {reg_metrics['mae']:.4f}, Recon acc: {exact_acc:.3f}, "
-                f"Token acc: {token_acc:.3f}, Validity: {validity:.3f}"
+                f"MAE: {reg_metrics['mae']:.4f}, Recon acc: {valid_exact_acc:.3f}, "
+                f"Token acc: {valid_token_acc:.3f}, Validity: {valid_validity:.3f}"
             )
 
             metrics = {
@@ -263,18 +268,21 @@ def train():
                 "train_recon": train_metrics["recon"],
                 "train_kl": train_metrics["kl"],
                 "train_reg_loss": train_metrics["reg"],
+                "train_recon_acc": train_exact_acc,
+                "train_token_acc": train_token_acc,
+                "train_validity": train_validity,
                 "valid_loss": valid_total,
                 "valid_recon": valid_recon,
                 "valid_kl": valid_kl,
                 "valid_reg_loss": valid_reg,
                 "valid_rmse": reg_metrics["rmse"],
                 "valid_mae": reg_metrics["mae"],
+                "valid_recon_acc": valid_exact_acc,
+                "valid_token_acc": valid_token_acc,
+                "valid_validity": valid_validity,
                 "grad_norm": train_metrics["grad"],
                 "beta": beta,
                 "learning_rate": lr,
-                "recon_acc": exact_acc,
-                "token_acc": token_acc,
-                "validity": validity,
             }
             mlflow.log_metrics(metrics, step=epoch + 1)
             for name, value in metrics.items():
