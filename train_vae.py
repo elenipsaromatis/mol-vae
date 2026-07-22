@@ -259,8 +259,10 @@ def train():
             )
             print(
                 f"         Valid loss: {valid_total:.4f}, Sol RMSE: {reg_metrics['rmse']:.4f}, "
-                f"MAE: {reg_metrics['mae']:.4f}, Recon acc: {valid_exact_acc:.3f}, "
-                f"Token acc: {valid_token_acc:.3f}, Validity: {valid_validity:.3f}"
+                f"MAE: {reg_metrics['mae']:.4f}, "
+                f"Validation recon_acc: {valid_exact_acc:.3f}, "
+                f"Validation token_acc: {valid_token_acc:.3f}, "
+                f"Validation validity: {valid_validity:.3f}"
             )
 
             metrics = {
