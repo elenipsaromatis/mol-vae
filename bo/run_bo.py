@@ -1,15 +1,17 @@
 """Candidate selection Bayesian optimisation over VAE latent embeddings.
 
-Steps:
-1. Load VAE latent embeddings and LD50 labels.
-2. Randomly observe 100 molecules.
-3. Fit a GP on observed LD50 values.
-4. Predict mu and sigma for all molecules.
-5. Compute UCB.
-6. Keep non-dominated unobserved candidates.
-7. Select the next candidate (UCB argmax, or ParetoSelector utopia distance).
-8. Add that selected candidate to the observed set.
-9. Repeat.
+Steps, per seed in RANDOM_SEEDS:
+1. Load VAE latent embeddings and LD50 labels (once).
+2. Fit a 3D PCA on the latent embeddings (once, shared by every seed/strategy).
+3. Latin Hypercube sample 100 initial molecules in that PCA space.
+4. For each selection strategy (UCB, Pareto), starting from that same initial set:
+   a. Fit a GP on observed LD50 values.
+   b. Predict mu and sigma for all molecules.
+   c. Compute UCB.
+   d. Keep non-dominated unobserved candidates.
+   e. Select the next candidate (UCB argmax, or ParetoSelector utopia distance).
+   f. Add that selected candidate to the observed set.
+   g. Repeat.
 
 Each iteration logs three CSVs into its own MLflow artifact folder: experiments, pareto front, selected recipes.
 """
@@ -29,9 +31,11 @@ import matplotlib.pyplot as plt
 
 import mlflow
 
+from sklearn.decomposition import PCA
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel
 from sklearn.preprocessing import StandardScaler
+from scipy.stats import qmc
 
 from bo.problem import load_bo_problem
 from bo.dashboard_artifacts import log_dashboard_general
@@ -40,9 +44,51 @@ from paretodo.selection.selector import ParetoSelector
 
 CHECKPOINT = Path("checkpoints/vae_solubility_70a6568a_best.pth")
 
+# Fixed seeds for the reproducible multi-seed BO sweep. Each seed draws its
+# own Latin Hypercube initial sample from the same fitted 3D PCA space.
+RANDOM_SEEDS = [11, 22, 33, 44, 55, 66, 77, 88, 99, 110]
+
 
 OBJ_MU_COL = "obj:max(\u03bc(LD50))"      # obj:max(mu(LD50))
 OBJ_SIGMA_COL = "obj:max(\u03c3(LD50))"   # obj:max(sigma(LD50))
+
+
+def select_initial_indices_lhs_pca(pca_coords, n_initial, seed):
+    """Latin Hypercube sample `n_initial` points in the fitted 3D PCA space,
+    then map each sampled point to the nearest not-yet-selected real molecule.
+
+    `pca_coords` must come from a single PCA fit on the fixed molecule pool
+    (fit once by the caller, reused across every seed and strategy) so all
+    seeds sample from the exact same 3D space. Returns unique global indices
+    into that pool, deterministic for a given seed.
+    """
+    n_candidates = pca_coords.shape[0]
+    if n_initial > n_candidates:
+        raise ValueError(
+            f"n_initial ({n_initial}) exceeds the molecule pool size "
+            f"({n_candidates})"
+        )
+
+    sampler = qmc.LatinHypercube(d=pca_coords.shape[1], seed=seed)
+    unit_samples = sampler.random(n=n_initial)
+
+    lower = pca_coords.min(axis=0)
+    upper = pca_coords.max(axis=0)
+    lhs_points = qmc.scale(unit_samples, lower, upper)
+
+    selected_indices = []
+    selected_set = set()
+
+    for point in lhs_points:
+        distances = np.linalg.norm(pca_coords - point, axis=1)
+        for candidate in np.argsort(distances):
+            candidate = int(candidate)
+            if candidate not in selected_set:
+                selected_indices.append(candidate)
+                selected_set.add(candidate)
+                break
+
+    return np.array(selected_indices, dtype=int)
 
 
 def fit_gp(X_observed, y_observed, seed):
@@ -390,18 +436,28 @@ def plot_convergence(history, save_path):
     plt.close(fig)
 
 
-def run_bo(args):
-    out_dir = Path(args.out_dir)
+def run_bo_single(
+    problem, X_scaled, initial_indices, seed, selection, out_dir, args, pca
+):
+    """Run one Bayesian optimisation loop for a single (seed, selection) pair.
+
+    `initial_indices` is the exact array generated once for this seed by
+    `select_initial_indices_lhs_pca`; the caller passes a `.copy()` per
+    strategy so a paired UCB/Pareto comparison never shares mutable state.
+    This function only reads `initial_indices` (via `.tolist()`, which
+    copies) and only reads from `problem`/`X_scaled` -- neither the caller's
+    array nor the shared problem data is mutated in place.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    problem = load_bo_problem(
-        checkpoint_path=args.checkpoint,
-        batch_size=args.batch_size,
-        device=args.device,
-        ld50_col=args.ld50_col,
-    )
+    n_initial = args.n_initial
+    candidate_pool = X_scaled
 
-    X = problem.X
+    assert len(initial_indices) == n_initial
+    assert len(np.unique(initial_indices)) == n_initial
+    assert initial_indices.min() >= 0
+    assert initial_indices.max() < len(candidate_pool)
+
     y = problem.y
 
     if args.objective == "minimize":
@@ -409,45 +465,65 @@ def run_bo(args):
     else:
         y_for_gp = y
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
     n_candidates = X_scaled.shape[0]
     all_indices = np.arange(n_candidates)
 
-    rng = np.random.default_rng(args.seed)
-
-    observed_indices = rng.choice(
-        n_candidates,
-        size=args.n_initial,
-        replace=False,
-    ).tolist()
+    observed_indices = initial_indices.tolist()
 
     history = []
 
     mlflow.set_experiment(args.experiment_name)
 
-    with mlflow.start_run(run_name=args.run_name):
+    run_name = args.run_name or f"seed{seed}_{selection}"
+
+    with mlflow.start_run(run_name=run_name):
         mlflow.log_params(
             {
                 "checkpoint": str(args.checkpoint),
                 "n_initial": args.n_initial,
                 "n_iterations": args.n_iterations,
                 "kappa": args.kappa,
-                "seed": args.seed,
+                "seed": seed,
                 "objective": args.objective,
-                "selection": args.selection,
+                "selection": selection,
                 "n_candidates": n_candidates,
-                "latent_dim": int(X.shape[1]),
+                "latent_dim": int(X_scaled.shape[1]),
                 "mode": args.mode,
+                "initial_sample_size": n_initial,
+                "sampling_method": "latin_hypercube_pca_nearest_neighbor",
+                "pca_n_components": int(pca.n_components_),
+                "pca_explained_variance_ratio_pc1": float(
+                    pca.explained_variance_ratio_[0]
+                ),
+                "pca_explained_variance_ratio_pc2": float(
+                    pca.explained_variance_ratio_[1]
+                ),
+                "pca_explained_variance_ratio_pc3": float(
+                    pca.explained_variance_ratio_[2]
+                ),
+                "pca_explained_variance_ratio_total": float(
+                    pca.explained_variance_ratio_.sum()
+                ),
             }
         )
 
-        # Always log the mode tag so the dashboard can react
+        # Always log the mode/seed/selection tags so the dashboard can react
         mlflow.set_tag("mode", args.mode)
+        mlflow.set_tag("seed", str(seed))
+        mlflow.set_tag("selection", selection)
 
         # Log the exact VAE checkpoint used
         mlflow.log_artifact(str(args.checkpoint), artifact_path="vae_checkpoint")
+
+        # Log the exact initial index array shared by this seed's UCB/Pareto pair
+        mlflow.log_artifact(
+            str(out_dir.parent / "initial_indices.npy"),
+            artifact_path="initial_sample",
+        )
+        mlflow.log_artifact(
+            str(out_dir.parent / "initial_sample.csv"),
+            artifact_path="initial_sample",
+        )
 
         log_dashboard_general(problem)
 
@@ -460,7 +536,7 @@ def run_bo(args):
             gp = fit_gp(
                 X_observed=X_observed,
                 y_observed=y_observed,
-                seed=args.seed + iteration,
+                seed=seed + iteration,
             )
 
             mu, sigma = gp.predict(X_scaled, return_std=True)
@@ -469,7 +545,7 @@ def run_bo(args):
 
             candidate_indices = np.setdiff1d(all_indices, observed_array)
 
-            if args.selection == "ucb":
+            if selection == "ucb":
                 selected_index = select_via_ucb(candidate_indices, ucb)
                 pareto_indices = compute_pareto_indices(
                     candidate_indices, mu, sigma
@@ -490,11 +566,13 @@ def run_bo(args):
                 mu=mu,
                 sigma=sigma,
                 ucb=ucb,
-                selection_method=args.selection,
+                selection_method=selection,
             )
 
             history.append(
                 {
+                    "seed": seed,
+                    "selection": selection,
                     "iteration": iteration,
                     "selected_recipe_id": int(selected_index),
                     "selected_smiles": str(problem.smiles[selected_index]),
@@ -536,7 +614,7 @@ def run_bo(args):
             )
 
             print(
-                f"iteration {iteration:03d} | "
+                f"[seed {seed} | {selection}] iteration {iteration:03d} | "
                 f"observed = {len(observed_indices)} | "
                 f"selected = {selected_index} | "
                 f"LD50 raw = {problem.y_raw[selected_index]:.4f} | "
@@ -561,6 +639,119 @@ def run_bo(args):
     return pd.DataFrame(history)
 
 
+def run_bo(args):
+    """Reproducible multi-seed BO sweep.
+
+    Loads the candidate pool and fits `StandardScaler` + 3D PCA exactly
+    once. For every seed, one Latin Hypercube initial sample is generated in
+    that fixed PCA space; the same index array (copied per strategy) is then
+    handed to every requested selection strategy so UCB vs. Pareto is a
+    paired, fair comparison. Each (seed, strategy) result is written to its
+    own subfolder so nothing overwrites a sibling run.
+    """
+    base_out_dir = Path(args.out_dir)
+    base_out_dir.mkdir(parents=True, exist_ok=True)
+
+    problem = load_bo_problem(
+        checkpoint_path=args.checkpoint,
+        batch_size=args.batch_size,
+        device=args.device,
+        ld50_col=args.ld50_col,
+    )
+
+    if args.seed is not None and args.seeds is not None:
+        raise ValueError(
+            "Pass either --seed (legacy single-seed alias) or --seeds, not both."
+        )
+
+    if args.seed is not None:
+        seeds = [args.seed]
+    elif args.seeds:
+        seeds = args.seeds
+    else:
+        seeds = RANDOM_SEEDS
+
+    X = problem.X
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # Fit PCA once on the fixed molecule pool (latent embeddings only, no
+    # LD50/target values involved). Every seed and every selection strategy
+    # samples its initial set from this same 3D space; it is never refit.
+    #
+    # svd_solver="auto" resolves deterministically to "covariance_eigh" for
+    # this pool shape (n_samples >> n_features), so no random_state is set
+    # here -- there is no randomized-solver step to seed.
+    pca = PCA(n_components=3)
+    pca_coords = pca.fit_transform(X_scaled)
+    print(f"PCA sampling-space shape: {pca_coords.shape}")
+    print(
+        "PCA explained variance ratio (pc1, pc2, pc3): "
+        f"{pca.explained_variance_ratio_}"
+    )
+
+    strategies = args.selection
+
+    results = {}
+
+    for seed in seeds:
+        initial_indices = select_initial_indices_lhs_pca(
+            pca_coords, n_initial=args.n_initial, seed=seed
+        )
+
+        n_selected = len(initial_indices)
+        all_unique = len(set(initial_indices.tolist())) == n_selected
+
+        print(
+            f"[seed {seed}] initial indices selected = {n_selected} | "
+            f"all unique = {all_unique}"
+        )
+
+        assert n_selected == args.n_initial, (
+            f"seed {seed}: expected {args.n_initial} initial indices, "
+            f"got {n_selected}"
+        )
+        assert all_unique, f"seed {seed}: duplicate molecule in initial set"
+
+        seed_dir = base_out_dir / f"seed_{seed}"
+        seed_dir.mkdir(parents=True, exist_ok=True)
+
+        # Saved once per seed (shared by every strategy) so nothing is
+        # duplicated across the sibling seed_{seed}/{ucb,pareto} folders.
+        np.save(seed_dir / "initial_indices.npy", initial_indices)
+
+        initial_sample_frame = pd.DataFrame(
+            {
+                "dataset_index": initial_indices,
+                # RecipeID elsewhere in this file is just the dataset index.
+                "recipe_id": initial_indices,
+                "smiles": problem.smiles[initial_indices],
+                "pc1": pca_coords[initial_indices, 0],
+                "pc2": pca_coords[initial_indices, 1],
+                "pc3": pca_coords[initial_indices, 2],
+            }
+        )
+        initial_sample_frame.to_csv(
+            seed_dir / "initial_sample.csv", index=False
+        )
+
+        for selection in strategies:
+            out_dir = seed_dir / selection
+            results[(seed, selection)] = run_bo_single(
+                problem=problem,
+                X_scaled=X_scaled,
+                initial_indices=initial_indices.copy(),
+                seed=seed,
+                selection=selection,
+                out_dir=out_dir,
+                args=args,
+                pca=pca,
+            )
+
+    return results
+
+
 def build_parser():
     parser = argparse.ArgumentParser()
 
@@ -571,7 +762,28 @@ def build_parser():
     parser.add_argument("--n-iterations", type=int, default=20)
 
     parser.add_argument("--kappa", type=float, default=1.96)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "One or more seeds for the reproducible sweep. Each seed draws "
+            "its own Latin Hypercube initial sample in PCA space. Defaults "
+            f"to RANDOM_SEEDS = {RANDOM_SEEDS}. Pass a single value (e.g. "
+            "'--seeds 11') to test one seed."
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "Legacy single-seed alias, equivalent to '--seeds SEED'. "
+            "Mutually exclusive with --seeds; kept for backward "
+            "compatibility with existing scripts/commands."
+        ),
+    )
 
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--device", default=None)
@@ -586,8 +798,14 @@ def build_parser():
     parser.add_argument(
         "--selection",
         choices=["pareto", "ucb"],
-        default="pareto",
-        help="pareto: ParetoSelector utopia distance. ucb: argmax UCB.",
+        nargs="+",
+        default=["ucb", "pareto"],
+        help=(
+            "pareto: ParetoSelector utopia distance. ucb: argmax UCB. "
+            "Both run by default, from the same initial sample per seed, "
+            "for a paired comparison. Pass one value to run only that "
+            "strategy."
+        ),
     )
 
     parser.add_argument("--experiment-name", default="bo-ld50")

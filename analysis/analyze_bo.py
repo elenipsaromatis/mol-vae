@@ -9,11 +9,14 @@ from typing import Dict, Iterable, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.lines import Line2D
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FIGURES_DIR = ROOT / "analysis" / "figures"
 DEFAULT_TABLES_DIR = ROOT / "analysis" / "tables"
+
+SEED_DIR_PATTERN = re.compile(r"seed[_-]?(\d+)", re.IGNORECASE)
 
 REQUIRED_COLUMNS = {
     "iteration",
@@ -26,11 +29,151 @@ OPTIONAL_COLUMNS = {
 }
 
 
+def detect_seed_and_strategy(
+    path: Path,
+) -> tuple[Optional[int], Optional[str]]:
+    seed: Optional[int] = None
+    strategy: Optional[str] = None
+
+    for part in path.parts:
+        if seed is None:
+            match = SEED_DIR_PATTERN.fullmatch(part)
+            if match:
+                seed = int(match.group(1))
+        if strategy is None and part.lower() in ("ucb", "pareto"):
+            strategy = part.lower()
+
+    return seed, strategy
+
+
+def require_existing_path(path_str: str, label: str) -> Path:
+    path = Path(path_str).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"{label} does not exist: {path}")
+    return path
+
+
+def resolve_traces_and_output_dirs(
+    args: argparse.Namespace,
+) -> tuple[list[str], Path, Path, Optional[int]]:
+    modes_used = sum(
+        [
+            bool(args.trace),
+            bool(args.ucb_trace or args.pareto_trace),
+            bool(args.traces),
+        ]
+    )
+    if modes_used == 0:
+        raise ValueError(
+            "No trace input provided. Use --trace, --ucb-trace together "
+            "with --pareto-trace, or pass one or more trace paths "
+            "positionally."
+        )
+    if modes_used > 1:
+        raise ValueError(
+            "Pass exactly one of: --trace, --ucb-trace/--pareto-trace, or "
+            "positional trace paths -- not a combination."
+        )
+
+    if args.trace:
+        trace_path = require_existing_path(args.trace, "--trace")
+        seed, strategy = detect_seed_and_strategy(trace_path)
+        output_dir = trace_path.parent / "analysis"
+
+        print(f"Selected trace: {trace_path}")
+        print(f"Detected seed: {seed if seed is not None else 'unknown'}")
+        print(
+            "Detected strategy: "
+            f"{strategy if strategy is not None else 'unknown'}"
+        )
+        print(f"Output directory: {output_dir}")
+
+        figures_dir = args.figures_dir or output_dir
+        tables_dir = args.tables_dir or output_dir
+        return [str(trace_path)], figures_dir, tables_dir, seed
+
+    if args.ucb_trace or args.pareto_trace:
+        if not (args.ucb_trace and args.pareto_trace):
+            raise ValueError(
+                "--ucb-trace and --pareto-trace must both be provided "
+                "together for a paired comparison."
+            )
+
+        ucb_path = require_existing_path(args.ucb_trace, "--ucb-trace")
+        pareto_path = require_existing_path(
+            args.pareto_trace, "--pareto-trace"
+        )
+
+        ucb_seed, ucb_strategy = detect_seed_and_strategy(ucb_path)
+        pareto_seed, pareto_strategy = detect_seed_and_strategy(pareto_path)
+
+        if ucb_seed is not None and pareto_seed is not None:
+            if ucb_seed != pareto_seed:
+                raise ValueError(
+                    f"--ucb-trace (seed {ucb_seed}) and --pareto-trace "
+                    f"(seed {pareto_seed}) do not belong to the same seed."
+                )
+            seed = ucb_seed
+        else:
+            print(
+                "Warning: could not detect a seed number from one or both "
+                "trace paths; skipping the same-seed validation.",
+                file=sys.stderr,
+            )
+            seed = None
+
+        output_dir = ucb_path.parent.parent / "comparison"
+
+        print(f"Selected UCB trace: {ucb_path}")
+        print(f"Selected Pareto trace: {pareto_path}")
+        print(f"Detected seed: {seed if seed is not None else 'unknown'}")
+        print(
+            "Detected strategies: "
+            f"{ucb_strategy or 'unknown'}, {pareto_strategy or 'unknown'}"
+        )
+        print(f"Output directory: {output_dir}")
+
+        figures_dir = args.figures_dir or output_dir
+        tables_dir = args.tables_dir or output_dir
+        return [str(ucb_path), str(pareto_path)], figures_dir, tables_dir, seed
+
+    resolved_paths = [
+        require_existing_path(raw, "trace path") for raw in args.traces
+    ]
+    figures_dir = args.figures_dir or DEFAULT_FIGURES_DIR
+    tables_dir = args.tables_dir or DEFAULT_TABLES_DIR
+
+    detected_seeds = {
+        detected
+        for detected, _strategy in (
+            detect_seed_and_strategy(path) for path in resolved_paths
+        )
+        if detected is not None
+    }
+    seed = detected_seeds.pop() if len(detected_seeds) == 1 else None
+
+    resolved = [str(path) for path in resolved_paths]
+    print(f"Selected traces: {resolved}")
+    print(f"Output directories: figures={figures_dir}, tables={tables_dir}")
+
+    return resolved, figures_dir, tables_dir, seed
+
+
 def normalise_label(path: Path) -> str:
-    """Create a readable plot/table label from a trace filename."""
+    """Create a readable plot/table label from a trace filename.
+
+    Falls back to the parent directory name when the filename itself is
+    the generic "bo_trace.csv" (the per-seed/-strategy BO output layout
+    names every trace file identically), since the stem alone would give
+    every trace the same meaningless "bo" label.
+    """
     label = path.stem
     label = re.sub(r"_trace$", "", label, flags=re.IGNORECASE)
     label = label.replace("_", " ").strip()
+
+    if label.lower() == "bo":
+        label = path.parent.name.replace("_", " ").strip()
+
     return label or path.stem
 
 
@@ -138,7 +281,7 @@ def load_traces(paths: Iterable[str]) -> Dict[str, pd.DataFrame]:
 
 
 def save_figure(fig: plt.Figure, output_path: Path) -> None:
-    """Save a figure using consistent thesis-friendly settings."""
+    """Save a figure using consistent settings"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -146,34 +289,147 @@ def save_figure(fig: plt.Figure, output_path: Path) -> None:
     print(f"Saved figure: {output_path}")
 
 
+def compute_dataset_max_ld50() -> Optional[float]:
+    """Compute the maximum raw LD50 value across the full BO candidate pool,
+    straight from the dataset. No VAE checkpoint is needed for this --
+    LD50 raw values don't depend on the model, only on the labels.
+
+    Returns None (with a printed warning) if the dataset can't be loaded,
+    so callers can still produce every other plot/table without it.
+    """
+    try:
+        sys.path.insert(0, str(ROOT))
+        from data import build_dataloaders_multitask
+
+        (
+            train_loader,
+            valid_loader,
+            test_loader,
+            _vocab_size,
+            _char2idx,
+            _idx2char,
+            _train_labels,
+            _sol_mean,
+            _sol_std,
+            ld50_mean,
+            ld50_std,
+        ) = build_dataloaders_multitask()
+    except Exception as error:
+        print(
+            f"Warning: could not compute the dataset maximum LD50 ({error}); "
+            "the convergence plot will omit that reference line.",
+            file=sys.stderr,
+        )
+        return None
+
+    ld50_mean = float(ld50_mean)
+    ld50_std = float(ld50_std)
+
+    max_raw = -np.inf
+    for loader in (train_loader, valid_loader, test_loader):
+        for _batch, labels in loader:
+            ld50_raw = labels[:, 1].numpy() * ld50_std + ld50_mean
+            max_raw = max(max_raw, float(ld50_raw.max()))
+
+    return max_raw
+
+
+def convergence_display_label(label: str) -> str:
+    """Rename method tokens for the convergence plot legend."""
+    label = re.sub(r"\bucb\b", "UCB", label, flags=re.IGNORECASE)
+    label = re.sub(r"\bpareto\b", "Pareto Front", label, flags=re.IGNORECASE)
+    return label
+
+
 def plot_convergence(
     traces: Dict[str, pd.DataFrame],
+    dataset_max_ld50: Optional[float],
     figures_dir: Path,
+    seed: Optional[int] = None,
 ) -> None:
     """Plot cumulative best observed LD50 for every run."""
+
     fig, ax = plt.subplots(figsize=(8, 5))
 
     for label, trace in traces.items():
-        best_so_far = trace["selected_ld50_raw"].cummax()
+        legend_label = convergence_display_label(label)
+        trace = trace.sort_values("iteration").copy()
+
+        observed_ld50 = pd.to_numeric(
+            trace["selected_ld50_raw"],
+            errors="coerce",
+        )
+
+        best_so_far = observed_ld50.cummax()
+
         ax.step(
             trace["iteration"],
             best_so_far,
             where="post",
             linewidth=2.2,
-            label=label,
+            label=legend_label,
         )
 
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Best observed LD50 found so far")
-    ax.set_title("Bayesian optimisation convergence")
+        best_discovered_ld50 = best_so_far.max()
+
+        first_best_mask = np.isclose(
+            best_so_far.to_numpy(dtype=float),
+            best_discovered_ld50,
+            equal_nan=False,
+        )
+
+        first_best_position = np.flatnonzero(first_best_mask)[0]
+        first_best_iteration = trace["iteration"].iloc[first_best_position]
+
+        # Highlight the first discovery of the best molecule for this run
+        ax.scatter(
+            first_best_iteration,
+            best_discovered_ld50,
+            s=75,
+            edgecolor="black",
+            linewidth=0.7,
+            zorder=4,
+        )
+
+    if dataset_max_ld50 is not None:
+        ax.axhline(
+            y=dataset_max_ld50,
+            linestyle="--",
+            linewidth=1.8,
+            color="black",
+            label=f"Dataset maximum LD50 = {dataset_max_ld50:.3f}",
+            zorder=1,
+        )
+
+    best_observed_handle = Line2D(
+        [],
+        [],
+        marker="o",
+        linestyle="None",
+        markersize=8,
+        markerfacecolor="white",
+        markeredgecolor="black",
+        markeredgewidth=0.7,
+        label="Best Observed Value",
+    )
+
+    handles, labels = ax.get_legend_handles_labels()
+    handles.append(best_observed_handle)
+    labels.append(best_observed_handle.get_label())
+
+    ax.set_xlabel("Iterations")
+    ax.set_ylabel("LD50 Values")
+    ax.set_title(
+        "Bayesian Optimization Convergence Plot"
+        + (f" (seed {seed})" if seed is not None else "")
+    )
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    ax.legend(handles, labels)
 
     save_figure(
         fig,
         figures_dir / "bo_convergence_comparison.png",
     )
-
 
 def add_top10_recovery(
     trace: pd.DataFrame,
@@ -220,6 +476,7 @@ def add_top10_recovery(
 def plot_top10_recovery(
     traces: Dict[str, pd.DataFrame],
     figures_dir: Path,
+    seed: Optional[int] = None,
 ) -> None:
     """Compare cumulative recovery of true top-10 molecules."""
     usable = {
@@ -249,7 +506,10 @@ def plot_top10_recovery(
 
     ax.set_xlabel("Iteration")
     ax.set_ylabel("Cumulative true top-10 molecules found")
-    ax.set_title("True top-10 recovery")
+    ax.set_title(
+        "True top-10 recovery"
+        + (f" (seed {seed})" if seed is not None else "")
+    )
     ax.set_ylim(bottom=0)
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -263,6 +523,7 @@ def plot_top10_recovery(
 def plot_selected_true_rank(
     traces: Dict[str, pd.DataFrame],
     figures_dir: Path,
+    seed: Optional[int] = None,
 ) -> None:
     """Plot the true LD50 rank of the molecule selected each iteration."""
     usable = {
@@ -290,7 +551,10 @@ def plot_selected_true_rank(
 
     ax.set_xlabel("Iteration")
     ax.set_ylabel("True LD50 rank of selected molecule")
-    ax.set_title("Quality of selected molecules")
+    ax.set_title(
+        "Quality of selected molecules"
+        + (f" (seed {seed})" if seed is not None else "")
+    )
     ax.invert_yaxis()
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -696,27 +960,64 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "traces",
-        nargs="+",
-        help="One or more paths to BO trace CSV files.",
+        nargs="*",
+        default=[],
+        help=(
+            "Legacy: one or more paths to BO trace CSV files, analysed/"
+            "compared generically. Prefer --trace or --ucb-trace/"
+            "--pareto-trace for seed-aware output folders. Mutually "
+            "exclusive with those options."
+        ),
+    )
+
+    parser.add_argument(
+        "--trace",
+        default=None,
+        help=(
+            "Analyse a single BO trace CSV, e.g. "
+            "bo/results/seed_11/ucb/bo_trace.csv. Output defaults to "
+            "'<trace_dir>/analysis/'."
+        ),
+    )
+
+    parser.add_argument(
+        "--ucb-trace",
+        default=None,
+        help=(
+            "UCB bo_trace.csv for a paired UCB-vs-Pareto comparison. Must "
+            "be passed together with --pareto-trace."
+        ),
+    )
+
+    parser.add_argument(
+        "--pareto-trace",
+        default=None,
+        help=(
+            "Pareto bo_trace.csv for a paired UCB-vs-Pareto comparison. "
+            "Must be passed together with --ucb-trace."
+        ),
     )
 
     parser.add_argument(
         "--figures-dir",
         type=Path,
-        default=DEFAULT_FIGURES_DIR,
+        default=None,
         help=(
-            "Directory for PNG figures. Default: "
-            "analysis/figures"
+            "Directory for PNG figures. Default depends on the input "
+            "mode: '<trace_dir>/analysis/' for --trace, "
+            "'<seed_dir>/comparison/' for --ucb-trace/--pareto-trace, or "
+            "analysis/figures for the legacy positional traces."
         ),
     )
 
     parser.add_argument(
         "--tables-dir",
         type=Path,
-        default=DEFAULT_TABLES_DIR,
+        default=None,
         help=(
-            "Directory for CSV tables. Default: "
-            "analysis/tables"
+            "Directory for CSV tables. Same default rules as "
+            "--figures-dir; analysis/tables for the legacy positional "
+            "traces."
         ),
     )
 
@@ -726,11 +1027,19 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    figures_dir = args.figures_dir.expanduser().resolve()
-    tables_dir = args.tables_dir.expanduser().resolve()
+    try:
+        trace_paths, figures_dir, tables_dir, seed = resolve_traces_and_output_dirs(
+            args
+        )
+    except (FileNotFoundError, ValueError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+
+    figures_dir = Path(figures_dir).expanduser().resolve()
+    tables_dir = Path(tables_dir).expanduser().resolve()
 
     try:
-        traces = load_traces(args.traces)
+        traces = load_traces(trace_paths)
     except (FileNotFoundError, ValueError, pd.errors.ParserError) as error:
         print(f"Error: {error}", file=sys.stderr)
         raise SystemExit(1) from error
@@ -756,9 +1065,10 @@ def main() -> None:
                 "'unique_top10_molecules_found' will be left blank."
             )
 
-    plot_convergence(traces, figures_dir)
-    plot_top10_recovery(traces, figures_dir)
-    plot_selected_true_rank(traces, figures_dir)
+    dataset_max_ld50 = compute_dataset_max_ld50()
+    plot_convergence(traces, dataset_max_ld50, figures_dir, seed=seed)
+    plot_top10_recovery(traces, figures_dir, seed=seed)
+    plot_selected_true_rank(traces, figures_dir, seed=seed)
 
     selection_summary = create_selection_summary(traces, tables_dir)
     create_best_molecules_table(traces, tables_dir)
