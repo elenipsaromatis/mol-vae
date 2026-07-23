@@ -10,12 +10,13 @@ import pandas as pd
 import torch
 from sklearn.decomposition import PCA
 from torch.utils.data import DataLoader
+import plotly.express as px
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from data import build_dataloaders_multitask  # noqa: E402
-from model import VAE  # noqa: E402
+from data import build_dataloaders_multitask 
+from model import VAE 
 
 
 DEFAULT_CHECKPOINT = (
@@ -192,17 +193,39 @@ def add_pca_coordinates(frame: pd.DataFrame) -> tuple[pd.DataFrame, PCA]:
         column for column in frame.columns if column.startswith("latent_")
     ]
 
+    pca = PCA(n_components=3)
+    coordinates = pca.fit_transform(frame[latent_columns].to_numpy())
+    print("PCA coordinates shape:", coordinates.shape)
+    print("Total explained variance:", pca.explained_variance_ratio_.sum())
+    output = frame.copy()
+    output["pc1"] = coordinates[:, 0]
+    output["pc2"] = coordinates[:, 1]
+    output["pc3"] = coordinates[:, 2]
+    output.insert(
+        0,
+        "recipe_id",
+        np.arange(len(output), dtype=int),
+    )
+
+    return output, pca
+
+
+def fit_ld50_only_pca(frame: pd.DataFrame) -> tuple[pd.DataFrame, PCA]:
+    """Independent 2-component PCA fit used only for the standalone LD50 plot.
+
+    Fit separately from add_pca_coordinates() so the LD50-only view isn't
+    tied to the shared solubility/combined/comparison-table axes.
+    """
+    latent_columns = [
+        column for column in frame.columns if column.startswith("latent_")
+    ]
+
     pca = PCA(n_components=2)
     coordinates = pca.fit_transform(frame[latent_columns].to_numpy())
 
     output = frame.copy()
     output["pc1"] = coordinates[:, 0]
     output["pc2"] = coordinates[:, 1]
-    output.insert(
-        0,
-        "recipe_id",
-        np.arange(len(output), dtype=int),
-    )
 
     return output, pca
 
@@ -302,6 +325,7 @@ def save_combined_plot(
 def save_tables(
     frame: pd.DataFrame,
     pca: PCA,
+    ld50_pca: PCA,
     tables_dir: Path,
 ) -> None:
     tables_dir.mkdir(parents=True, exist_ok=True)
@@ -326,6 +350,9 @@ def save_tables(
                 "pc2_explained_variance_ratio": float(
                     pca.explained_variance_ratio_[1]
                 ),
+                "pc3_explained_variance_ratio": float(
+                    pca.explained_variance_ratio_[2]
+                ),
                 "total_explained_variance_ratio": float(
                     pca.explained_variance_ratio_.sum()
                 ),
@@ -335,14 +362,29 @@ def save_tables(
                 "solubility_pc2_correlation": float(
                     frame["solubility"].corr(frame["pc2"])
                 ),
+                "solubility_pc3_correlation": float(
+                    frame["solubility"].corr(frame["pc3"])
+                ),
                 "ld50_pc1_correlation": float(
                     frame["ld50"].corr(frame["pc1"])
                 ),
                 "ld50_pc2_correlation": float(
                     frame["ld50"].corr(frame["pc2"])
                 ),
+                "ld50_pc3_correlation": float(
+                    frame["ld50"].corr(frame["pc3"])
+                ),
                 "solubility_ld50_correlation": float(
                     frame["solubility"].corr(frame["ld50"])
+                ),
+                "ld50_only_pc1_explained_variance_ratio": float(
+                    ld50_pca.explained_variance_ratio_[0]
+                ),
+                "ld50_only_pc2_explained_variance_ratio": float(
+                    ld50_pca.explained_variance_ratio_[1]
+                ),
+                "ld50_only_total_explained_variance_ratio": float(
+                    ld50_pca.explained_variance_ratio_.sum()
                 ),
             }
         ]
@@ -352,6 +394,122 @@ def save_tables(
     summary.to_csv(summary_path, index=False)
     print(f"Saved Table: {summary_path}")
 
+def save_interactive_3d_plot(
+    frame: pd.DataFrame,
+    property_column: str,
+    property_label: str,
+    title: str,
+    output_path: Path,
+    explained_variance: np.ndarray,
+) -> None:
+    plot_frame = frame.copy()
+
+    figure = px.scatter_3d(
+        plot_frame,
+        x="pc1",
+        y="pc2",
+        z="pc3",
+        color=property_column,
+        hover_data={
+            "recipe_id": True,
+            "smiles": True,
+            "split": True,
+            "solubility": ":.3f",
+            "ld50": ":.3f",
+            "pc1": ":.3f",
+            "pc2": ":.3f",
+            "pc3": ":.3f",
+        },
+        labels={
+            "pc1": (
+                f"Principal Component 1 "
+                f"({explained_variance[0] * 100:.1f}%)"
+            ),
+            "pc2": (
+                f"Principal Component 2 "
+                f"({explained_variance[1] * 100:.1f}%)"
+            ),
+            "pc3": (
+                f"Principal Component 3 "
+                f"({explained_variance[2] * 100:.1f}%)"
+            ),
+            property_column: property_label,
+        },
+        title=title,
+        opacity=0.65,
+    )
+
+    figure.update_traces(
+        marker={
+            "size": 3,
+        }
+    )
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    figure.write_html(output_path)
+
+    print(f"Saved Interactive Figure: {output_path}")
+
+def save_3d_property_plot(
+    frame: pd.DataFrame,
+    property_column: str,
+    property_label: str,
+    title: str,
+    output_path: Path,
+    explained_variance: np.ndarray,
+) -> None:
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111, projection="3d")
+
+    scatter = ax.scatter(
+        frame["pc1"],
+        frame["pc2"],
+        frame["pc3"],
+        c=frame[property_column],
+        s=18,
+        alpha=0.60,
+    )
+
+    colorbar = fig.colorbar(
+        scatter,
+        ax=ax,
+        shrink=0.75,
+        pad=0.10,
+    )
+    colorbar.set_label(property_label)
+
+    ax.set_xlabel(
+        f"Principal Component 1 "
+        f"({explained_variance[0] * 100:.1f}%)"
+    )
+    ax.set_ylabel(
+        f"Principal Component 2 "
+        f"({explained_variance[1] * 100:.1f}%)"
+    )
+    ax.set_zlabel(
+        f"Principal Component 3 "
+        f"({explained_variance[2] * 100:.1f}%)"
+    )
+
+    ax.set_title(title)
+    ax.view_init(elev=25, azim=45)
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    fig.tight_layout()
+    fig.savefig(
+        output_path,
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+    print(f"Saved Figure: {output_path}")
 
 def main() -> None:
     args = parse_args()
@@ -419,6 +577,7 @@ def main() -> None:
             ignore_index=True,
         )
         latent_frame, pca = add_pca_coordinates(latent_frame)
+        ld50_only_frame, ld50_pca = fit_ld50_only_pca(latent_frame)
 
     except Exception as error:
         print(f"Error: {error}", file=sys.stderr)
@@ -433,6 +592,10 @@ def main() -> None:
         "Total Explained Variance: "
         f"{pca.explained_variance_ratio_.sum():.4f}"
     )
+    print(
+        "LD50-Only Explained Variance: "
+        f"{ld50_pca.explained_variance_ratio_.sum():.4f}"
+    )
 
     save_single_property_plot(
         frame=latent_frame,
@@ -443,21 +606,62 @@ def main() -> None:
         explained_variance=pca.explained_variance_ratio_,
     )
     save_single_property_plot(
-        frame=latent_frame,
+        frame=ld50_only_frame,
         property_column="ld50",
         property_label="LD50",
         title="Latent Space Colored By LD50",
         output_path=figures_dir / "latent_space_ld50.png",
-        explained_variance=pca.explained_variance_ratio_,
+        explained_variance=ld50_pca.explained_variance_ratio_,
     )
     save_combined_plot(
         frame=latent_frame,
         output_path=figures_dir / "latent_space_properties.png",
         explained_variance=pca.explained_variance_ratio_,
     )
+    save_interactive_3d_plot(
+        frame=latent_frame,
+        property_column="solubility",
+        property_label="Solubility",
+        title="Three-Dimensional Latent Space Colored By Solubility",
+        output_path=(
+            figures_dir / "latent_space_3d_solubility.html"
+        ),
+        explained_variance=pca.explained_variance_ratio_,
+    )
+    save_interactive_3d_plot(
+        frame=latent_frame,
+        property_column="ld50",
+        property_label="LD50",
+        title="Three-Dimensional Latent Space Colored By LD50",
+        output_path=(
+            figures_dir / "latent_space_3d_ld50.html"
+        ),
+        explained_variance=pca.explained_variance_ratio_,
+    )
+    save_3d_property_plot(
+        frame=latent_frame,
+        property_column="solubility",
+        property_label="Solubility",
+        title="Three-Dimensional Latent Space Colored By Solubility",
+        output_path=(
+            figures_dir / "latent_space_3d_solubility.png"
+        ),
+        explained_variance=pca.explained_variance_ratio_,
+    )
+    save_3d_property_plot(
+        frame=latent_frame,
+        property_column="ld50",
+        property_label="LD50",
+        title="Three-Dimensional Latent Space Colored By LD50",
+        output_path=(
+            figures_dir / "latent_space_3d_ld50.png"
+        ),
+        explained_variance=pca.explained_variance_ratio_,
+    )
     save_tables(
         frame=latent_frame,
         pca=pca,
+        ld50_pca=ld50_pca,
         tables_dir=tables_dir,
     )
 
