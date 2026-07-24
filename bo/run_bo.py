@@ -639,6 +639,163 @@ def run_bo_single(
     return pd.DataFrame(history)
 
 
+def run_random_single(
+    problem,
+    initial_indices,
+    seed,
+    out_dir,
+    args,
+):
+    """Run a random-search baseline for a single seed.
+
+    Starts from the exact same `initial_indices` used by the UCB/Pareto BO
+    strategies for this seed, then repeatedly picks a uniformly random
+    unobserved candidate via a local `np.random.default_rng(seed)`. No GP,
+    PCA, or Pareto front is involved -- this is a plain baseline against
+    which the BO strategies are compared.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    selection = "random"
+    representation = "none"
+
+    n_initial = args.n_initial
+    n_candidates = problem.X.shape[0]
+    all_indices = np.arange(n_candidates)
+
+    observed_indices = initial_indices.tolist()
+
+    rng = np.random.default_rng(seed)
+
+    history = []
+
+    mlflow.set_experiment(args.experiment_name)
+
+    run_name = args.run_name or f"seed{seed}_random"
+
+    with mlflow.start_run(run_name=run_name):
+        mlflow.log_params(
+            {
+                "checkpoint": str(args.checkpoint),
+                "n_initial": args.n_initial,
+                "n_iterations": args.n_iterations,
+                "seed": seed,
+                "objective": args.objective,
+                "selection": selection,
+                "representation": representation,
+                "n_candidates": n_candidates,
+                "mode": args.mode,
+                "initial_sample_size": n_initial,
+                "sampling_method": "latin_hypercube_pca_nearest_neighbor",
+            }
+        )
+
+        # Always log the mode/seed/selection/representation tags so the
+        # dashboard can react.
+        mlflow.set_tag("mode", args.mode)
+        mlflow.set_tag("seed", str(seed))
+        mlflow.set_tag("selection", selection)
+        mlflow.set_tag("representation", representation)
+
+        # Log the exact initial index array shared by this seed's
+        # UCB/Pareto/random trio.
+        mlflow.log_artifact(
+            str(out_dir.parent / "initial_indices.npy"),
+            artifact_path="initial_sample",
+        )
+        mlflow.log_artifact(
+            str(out_dir.parent / "initial_sample.csv"),
+            artifact_path="initial_sample",
+        )
+
+        for iteration in range(args.n_iterations):
+            observed_array = np.array(observed_indices, dtype=int)
+
+            candidate_indices = np.setdiff1d(all_indices, observed_array)
+            selected_index = int(rng.choice(candidate_indices))
+
+            selected_ld50_raw = float(problem.y_raw[selected_index])
+            selected_ld50_standardised = float(problem.y[selected_index])
+
+            observed_raw_before = problem.y_raw[observed_array]
+            observed_raw_after = np.append(observed_raw_before, selected_ld50_raw)
+
+            if args.objective == "minimize":
+                best_ld50_before = float(observed_raw_before.min())
+                best_ld50_after = float(observed_raw_after.min())
+            else:
+                best_ld50_before = float(observed_raw_before.max())
+                best_ld50_after = float(observed_raw_after.max())
+
+            # True LD50 rank/top-10 respect the objective direction: for
+            # "maximize" a larger LD50 ranks higher (ascending=False); for
+            # "minimize" a smaller LD50 ranks higher (ascending=True).
+            rank_ascending = args.objective == "minimize"
+            selected_true_ld50_rank = int(
+                pd.Series(problem.y_raw)
+                .rank(method="min", ascending=rank_ascending)
+                .iloc[selected_index]
+            )
+            selected_is_true_top_10 = bool(selected_true_ld50_rank <= 10)
+
+            history.append(
+                {
+                    "seed": seed,
+                    "selection": selection,
+                    "representation": representation,
+                    "iteration": iteration,
+                    "selected_recipe_id": int(selected_index),
+                    "selected_smiles": str(problem.smiles[selected_index]),
+                    "n_observed_before": len(observed_indices),
+                    "selected_index": int(selected_index),
+                    "selected_ld50_standardised": selected_ld50_standardised,
+                    "selected_ld50_raw": selected_ld50_raw,
+                    "best_ld50_before": best_ld50_before,
+                    "best_ld50_after": best_ld50_after,
+                    "selected_mu": np.nan,
+                    "selected_sigma": np.nan,
+                    "selected_ucb": np.nan,
+                    "selected_ucb_rank": np.nan,
+                    "selected_true_ld50_rank": selected_true_ld50_rank,
+                    "selected_is_true_top_10": selected_is_true_top_10,
+                    "n_non_dominated": np.nan,
+                }
+            )
+
+            mlflow.log_metrics(
+                {
+                    "selected_ld50_raw": selected_ld50_raw,
+                    "best_ld50_before": best_ld50_before,
+                    "best_ld50_after": best_ld50_after,
+                },
+                step=iteration,
+            )
+
+            print(
+                f"[seed {seed} | random] iteration {iteration:03d} | "
+                f"observed = {len(observed_indices)} | "
+                f"selected = {selected_index} | "
+                f"LD50 raw = {selected_ld50_raw:.4f} | "
+                f"best before = {best_ld50_before:.4f} | "
+                f"best after = {best_ld50_after:.4f}"
+            )
+
+            observed_indices.append(selected_index)
+
+            pd.DataFrame(history).to_csv(out_dir / "bo_trace.csv", index=False)
+            np.save(out_dir / "observed_indices.npy", np.array(observed_indices))
+
+        mlflow.log_artifact(str(out_dir / "bo_trace.csv"))
+
+        # Run-level convergence plot across all iterations.
+        with tempfile.TemporaryDirectory() as tmp:
+            conv_path = os.path.join(tmp, "convergence.png")
+            plot_convergence(history, conv_path)
+            mlflow.log_artifact(conv_path)
+
+    return pd.DataFrame(history)
+
+
 def run_bo(args):
     """Reproducible multi-seed BO sweep.
 
@@ -749,6 +906,17 @@ def run_bo(args):
                 pca=pca,
             )
 
+        if args.run_random:
+            random_out_dir = seed_dir / "random"
+
+            results[(seed, "random")] = run_random_single(
+                problem=problem,
+                initial_indices=initial_indices.copy(),
+                seed=seed,
+                out_dir=random_out_dir,
+                args=args,
+            )
+
     return results
 
 
@@ -810,6 +978,15 @@ def build_parser():
 
     parser.add_argument("--experiment-name", default="bo-ld50")
     parser.add_argument("--run-name", default=None)
+
+    parser.add_argument(
+        "--run-random",
+        action="store_true",
+        help=(
+            "Run a random-search baseline using the same initial "
+            "molecule indices as the BO strategies."
+        ),
+    )
 
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
