@@ -20,3 +20,6 @@ best_params.json.temp/
 
 bo/results/seed_*/
 bo/results/seed_comparison/
+bo/results/*/seed_*/
+bo/results/*/seed_comparison/
+bo/results/baseline_test/
