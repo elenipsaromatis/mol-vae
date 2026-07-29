@@ -71,11 +71,12 @@ def load_one_trace(
 
     frame = pd.read_csv(path)
 
-    required = {iteration_col, metric_col}
+    required = {iteration_col, metric_col, "initial_best_ld50"}
     missing = required.difference(frame.columns)
     if missing:
         return None, (
-            f"missing required column(s) {sorted(missing)} in {path}"
+            f"missing required column(s) {sorted(missing)} in {path} -- "
+            "results must be regenerated with the current bo/run_bo.py"
         )
 
     frame = frame.sort_values(iteration_col).reset_index(drop=True)
@@ -93,7 +94,16 @@ def load_one_trace(
     # columns say -- the folder layout is the source of truth here.
     frame["seed"] = seed
     frame["strategy"] = strategy
-    frame[f"running_best_{metric_col}"] = frame[metric_col].cummax()
+
+    # Seed the running-best with the shared initial sample's best LD50, so
+    # a strategy whose first few picks underperform the initial sample
+    # doesn't appear to start lower than a sibling strategy sharing the
+    # exact same initial_indices (see bo/run_bo.py's plot_convergence).
+    initial_best = float(frame["initial_best_ld50"].iloc[0])
+    seeded_metric = np.concatenate(
+        [[initial_best], frame[metric_col].to_numpy(dtype=float)]
+    )
+    frame[f"running_best_{metric_col}"] = np.maximum.accumulate(seeded_metric)[1:]
 
     return frame, None
 
