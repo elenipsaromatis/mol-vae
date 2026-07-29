@@ -4,12 +4,12 @@ Steps, per seed in RANDOM_SEEDS:
 1. Load VAE latent embeddings and LD50 labels (once).
 2. Fit a 3D PCA on the latent embeddings (once, shared by every seed/strategy).
 3. Latin Hypercube sample 100 initial molecules in that PCA space.
-4. For each selection strategy (UCB, Pareto), starting from that same initial set:
+4. For each selection strategy (UCB, Pareto, EI), starting from that same initial set:
    a. Fit a GP on observed LD50 values.
    b. Predict mu and sigma for all molecules.
-   c. Compute UCB.
+   c. Compute UCB and Expected Improvement.
    d. Keep non-dominated unobserved candidates.
-   e. Select the next candidate (UCB argmax, or ParetoSelector utopia distance).
+   e. Select the next candidate (UCB argmax, EI argmax, or ParetoSelector utopia distance).
    f. Add that selected candidate to the observed set.
    g. Repeat.
 
@@ -35,7 +35,7 @@ from sklearn.decomposition import PCA
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel
 from sklearn.preprocessing import StandardScaler
-from scipy.stats import qmc
+from scipy.stats import norm, qmc
 
 from bo.problem import load_bo_problem
 from bo.dashboard_artifacts import log_dashboard_general
@@ -161,6 +161,26 @@ def compute_pareto_indices(candidate_indices, mu, sigma):
 def select_via_ucb(candidate_indices, ucb):
     """Pick the unobserved candidate with the highest UCB."""
     best_local = int(np.argmax(ucb[candidate_indices]))
+    return int(candidate_indices[best_local])
+
+
+def compute_ei(mu, sigma, best_f, xi=0.01):
+    """Expected Improvement for a maximised objective.
+
+    `best_f` is the best (GP-scale) objective value observed so far. Points
+    with sigma == 0 (e.g. already-observed molecules) get EI = 0 rather than
+    a divide-by-zero NaN.
+    """
+    sigma_safe = np.where(sigma > 0, sigma, 1.0)
+    improvement = mu - best_f - xi
+    z = improvement / sigma_safe
+    ei = improvement * norm.cdf(z) + sigma_safe * norm.pdf(z)
+    return np.where(sigma > 0, ei, 0.0)
+
+
+def select_via_ei(candidate_indices, ei):
+    """Pick the unobserved candidate with the highest Expected Improvement."""
+    best_local = int(np.argmax(ei[candidate_indices]))
     return int(candidate_indices[best_local])
 
 
@@ -294,6 +314,7 @@ def log_iteration_artifacts(
     mu,
     sigma,
     ucb,
+    ei,
     selection_method,
 ):
     """Write experiments/pareto front/selected recipes for this iteration
@@ -325,6 +346,7 @@ def log_iteration_artifacts(
                 "mu": float(mu[selected_index]),
                 "sigma": float(sigma[selected_index]),
                 "ucb": float(ucb[selected_index]),
+                "ei": float(ei[selected_index]),
                 "ld50_raw": float(problem.y_raw[selected_index]),
                 "ld50_standardised": float(problem.y[selected_index]),
                 "selection_method": selection_method,
@@ -342,6 +364,7 @@ def log_iteration_artifacts(
             "mu": mu[all_indices],
             "sigma": sigma[all_indices],
             "ucb": ucb[all_indices],
+            "ei": ei[all_indices],
             "observed": np.isin(all_indices, observed_array),
             "candidate": np.isin(all_indices, candidate_indices),
             "is_pareto": np.isin(all_indices, pareto_indices),
@@ -352,6 +375,12 @@ def log_iteration_artifacts(
     # Rank candidates by acquisition score and true LD50
     all_predictions["ucb_rank"] = (
         all_predictions["ucb"]
+        .rank(method="min", ascending=False)
+        .astype(int)
+    )
+
+    all_predictions["ei_rank"] = (
+        all_predictions["ei"]
         .rank(method="min", ascending=False)
         .astype(int)
     )
@@ -403,36 +432,93 @@ def log_iteration_artifacts(
         mlflow.log_artifact(plot_path, artifact_path=folder)
 
 
+def _assert_convergence_monotonic(
+    initial_best_ld50, history, objective, seed, selection
+):
+    """Verify the best-observed-so-far sequence (x=0 initial, then
+    best_ld50_after per iteration) never regresses for the given objective.
+    """
+    if not history:
+        return
+
+    sequence = np.array(
+        [initial_best_ld50] + [h["best_ld50_after"] for h in history],
+        dtype=float,
+    )
+    diffs = np.diff(sequence)
+
+    if objective == "maximize":
+        ok = np.all(diffs >= -1e-9)
+    else:
+        ok = np.all(diffs <= 1e-9)
+
+    assert ok, (
+        f"seed {seed} | {selection}: convergence sequence is not "
+        f"monotonic for objective={objective}: {sequence.tolist()}"
+    )
+
+
 def plot_convergence(history, save_path):
-    """Selected LD50 (raw) per iteration, with a running best line."""
-    iters = [h["iteration"] for h in history]
-    ld50 = np.array([h["selected_ld50_raw"] for h in history], dtype=float)
-    running_best = np.maximum.accumulate(ld50)
+    """Plot best observed raw LD50 including the initial sample."""
+    if not history:
+        return
+
+    evaluations = np.array(
+        [h["iteration"] + 1 for h in history],
+        dtype=int,
+    )
+
+    best_observed = np.array(
+        [h["best_ld50_after"] for h in history],
+        dtype=float,
+    )
+
+    initial_best = float(
+        history[0]["initial_best_ld50"]
+    )
+
+    x = np.concatenate(
+        [
+            np.array([0], dtype=int),
+            evaluations,
+        ]
+    )
+
+    y = np.concatenate(
+        [
+            np.array([initial_best], dtype=float),
+            best_observed,
+        ]
+    )
 
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(
-        iters,
-        ld50,
-        marker="o",
-        markersize=4,
-        linewidth=1.0,
-        color="tab:grey",
-        label="selected LD50",
-    )
-    ax.plot(
-        iters,
-        running_best,
+
+    ax.step(
+        x,
+        y,
+        where="post",
         linewidth=2.0,
-        color="tab:red",
-        label="running best",
+        label="Best observed LD50",
     )
-    ax.set_xlabel("iteration")
-    ax.set_ylabel("LD50 (raw)")
-    ax.set_title("BO convergence")
-    ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
-    ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
+
+    ax.scatter(
+        [0],
+        [initial_best],
+        s=45,
+        label="Best initial molecule",
+        zorder=3,
+    )
+
+    ax.set_xlabel("Additional molecule evaluations")
+    ax.set_ylabel("Best observed LD50")
+    ax.set_title("Optimisation convergence")
+    ax.xaxis.set_major_locator(
+        plt.MaxNLocator(integer=True)
+    )
+    ax.grid(True, alpha=0.25)
+    ax.legend()
     fig.tight_layout()
-    fig.savefig(save_path, dpi=150)
+    fig.savefig(save_path, dpi=300)
     plt.close(fig)
 
 
@@ -470,6 +556,26 @@ def run_bo_single(
 
     observed_indices = initial_indices.tolist()
 
+    if args.objective == "maximize":
+        initial_best_ld50 = float(
+            np.max(problem.y_raw[initial_indices])
+        )
+    else:
+        initial_best_ld50 = float(
+            np.min(problem.y_raw[initial_indices])
+        )
+
+    # Never request more acquisitions than there are unobserved molecules
+    # left in the pool.
+    n_available = n_candidates - len(initial_indices)
+    n_run_iterations = min(args.n_iterations, n_available)
+    if n_run_iterations < args.n_iterations:
+        print(
+            f"[seed {seed} | {selection}] requested n_iterations="
+            f"{args.n_iterations} exceeds remaining unobserved molecules "
+            f"({n_available}); capping to {n_run_iterations}."
+        )
+
     history = []
 
     mlflow.set_experiment(args.experiment_name)
@@ -504,6 +610,7 @@ def run_bo_single(
                 "pca_explained_variance_ratio_total": float(
                     pca.explained_variance_ratio_.sum()
                 ),
+                "n_iterations_actual": n_run_iterations,
             }
         )
 
@@ -527,7 +634,7 @@ def run_bo_single(
 
         log_dashboard_general(problem)
 
-        for iteration in range(args.n_iterations):
+        for iteration in range(n_run_iterations):
             observed_array = np.array(observed_indices, dtype=int)
 
             X_observed = X_scaled[observed_array]
@@ -542,11 +649,18 @@ def run_bo_single(
             mu, sigma = gp.predict(X_scaled, return_std=True)
 
             ucb = mu + args.kappa * sigma
+            best_f = float(np.max(y_observed))
+            ei = compute_ei(mu, sigma, best_f)
 
             candidate_indices = np.setdiff1d(all_indices, observed_array)
 
             if selection == "ucb":
                 selected_index = select_via_ucb(candidate_indices, ucb)
+                pareto_indices = compute_pareto_indices(
+                    candidate_indices, mu, sigma
+                )
+            elif selection == "ei":
+                selected_index = select_via_ei(candidate_indices, ei)
                 pareto_indices = compute_pareto_indices(
                     candidate_indices, mu, sigma
                 )
@@ -566,8 +680,38 @@ def run_bo_single(
                 mu=mu,
                 sigma=sigma,
                 ucb=ucb,
+                ei=ei,
                 selection_method=selection,
             )
+
+            selected_ld50_raw = float(
+                problem.y_raw[selected_index]
+            )
+
+            if args.objective == "maximize":
+                best_ld50_before = float(
+                    np.max(problem.y_raw[observed_array])
+                )
+                best_ld50_after = float(
+                    max(best_ld50_before, selected_ld50_raw)
+                )
+                assert best_ld50_after >= best_ld50_before, (
+                    f"seed {seed} | {selection} | iteration {iteration}: "
+                    f"best_ld50_after ({best_ld50_after}) < best_ld50_before "
+                    f"({best_ld50_before}) for a maximisation objective"
+                )
+            else:
+                best_ld50_before = float(
+                    np.min(problem.y_raw[observed_array])
+                )
+                best_ld50_after = float(
+                    min(best_ld50_before, selected_ld50_raw)
+                )
+                assert best_ld50_after <= best_ld50_before, (
+                    f"seed {seed} | {selection} | iteration {iteration}: "
+                    f"best_ld50_after ({best_ld50_after}) > best_ld50_before "
+                    f"({best_ld50_before}) for a minimisation objective"
+                )
 
             history.append(
                 {
@@ -579,12 +723,24 @@ def run_bo_single(
                     "n_observed_before": len(observed_indices),
                     "selected_index": int(selected_index),
                     "selected_ld50_standardised": float(problem.y[selected_index]),
-                    "selected_ld50_raw": float(problem.y_raw[selected_index]),
+                    "selected_ld50_raw": selected_ld50_raw,
+                    "initial_best_ld50": initial_best_ld50,
+                    "best_ld50_before": best_ld50_before,
+                    "best_ld50_after": best_ld50_after,
+                    "improved_best": bool(
+                        best_ld50_after != best_ld50_before
+                    ),
                     "selected_mu": float(mu[selected_index]),
                     "selected_sigma": float(sigma[selected_index]),
                     "selected_ucb": float(ucb[selected_index]),
                     "selected_ucb_rank": int(
                         pd.Series(ucb)
+                        .rank(method="min", ascending=False)
+                        .iloc[selected_index]
+                    ),
+                    "selected_ei": float(ei[selected_index]),
+                    "selected_ei_rank": int(
+                        pd.Series(ei)
                         .rank(method="min", ascending=False)
                         .iloc[selected_index]
                     ),
@@ -604,10 +760,12 @@ def run_bo_single(
 
             mlflow.log_metrics(
                 {
-                    "selected_ld50_raw": float(problem.y_raw[selected_index]),
+                    "selected_ld50_raw": selected_ld50_raw,
+                    "best_ld50_after": best_ld50_after,
                     "selected_mu": float(mu[selected_index]),
                     "selected_sigma": float(sigma[selected_index]),
                     "selected_ucb": float(ucb[selected_index]),
+                    "selected_ei": float(ei[selected_index]),
                     "n_non_dominated": int(len(pareto_indices)),
                 },
                 step=iteration,
@@ -627,6 +785,10 @@ def run_bo_single(
 
             pd.DataFrame(history).to_csv(out_dir / "bo_trace.csv", index=False)
             np.save(out_dir / "observed_indices.npy", np.array(observed_indices))
+
+        _assert_convergence_monotonic(
+            initial_best_ld50, history, args.objective, seed, selection
+        )
 
         mlflow.log_artifact(str(out_dir / "bo_trace.csv"))
 
@@ -665,6 +827,26 @@ def run_random_single(
 
     observed_indices = initial_indices.tolist()
 
+    if args.objective == "maximize":
+        initial_best_ld50 = float(
+            np.max(problem.y_raw[initial_indices])
+        )
+    else:
+        initial_best_ld50 = float(
+            np.min(problem.y_raw[initial_indices])
+        )
+
+    # Never request more acquisitions than there are unobserved molecules
+    # left in the pool.
+    n_available = n_candidates - len(initial_indices)
+    n_run_iterations = min(args.n_iterations, n_available)
+    if n_run_iterations < args.n_iterations:
+        print(
+            f"[seed {seed} | random] requested n_iterations="
+            f"{args.n_iterations} exceeds remaining unobserved molecules "
+            f"({n_available}); capping to {n_run_iterations}."
+        )
+
     rng = np.random.default_rng(seed)
 
     history = []
@@ -687,6 +869,7 @@ def run_random_single(
                 "mode": args.mode,
                 "initial_sample_size": n_initial,
                 "sampling_method": "latin_hypercube_pca_nearest_neighbor",
+                "n_iterations_actual": n_run_iterations,
             }
         )
 
@@ -708,7 +891,7 @@ def run_random_single(
             artifact_path="initial_sample",
         )
 
-        for iteration in range(args.n_iterations):
+        for iteration in range(n_run_iterations):
             observed_array = np.array(observed_indices, dtype=int)
 
             candidate_indices = np.setdiff1d(all_indices, observed_array)
@@ -717,15 +900,30 @@ def run_random_single(
             selected_ld50_raw = float(problem.y_raw[selected_index])
             selected_ld50_standardised = float(problem.y[selected_index])
 
-            observed_raw_before = problem.y_raw[observed_array]
-            observed_raw_after = np.append(observed_raw_before, selected_ld50_raw)
-
-            if args.objective == "minimize":
-                best_ld50_before = float(observed_raw_before.min())
-                best_ld50_after = float(observed_raw_after.min())
+            if args.objective == "maximize":
+                best_ld50_before = float(
+                    np.max(problem.y_raw[observed_array])
+                )
+                best_ld50_after = float(
+                    max(best_ld50_before, selected_ld50_raw)
+                )
+                assert best_ld50_after >= best_ld50_before, (
+                    f"seed {seed} | random | iteration {iteration}: "
+                    f"best_ld50_after ({best_ld50_after}) < best_ld50_before "
+                    f"({best_ld50_before}) for a maximisation objective"
+                )
             else:
-                best_ld50_before = float(observed_raw_before.max())
-                best_ld50_after = float(observed_raw_after.max())
+                best_ld50_before = float(
+                    np.min(problem.y_raw[observed_array])
+                )
+                best_ld50_after = float(
+                    min(best_ld50_before, selected_ld50_raw)
+                )
+                assert best_ld50_after <= best_ld50_before, (
+                    f"seed {seed} | random | iteration {iteration}: "
+                    f"best_ld50_after ({best_ld50_after}) > best_ld50_before "
+                    f"({best_ld50_before}) for a minimisation objective"
+                )
 
             # True LD50 rank/top-10 respect the objective direction: for
             # "maximize" a larger LD50 ranks higher (ascending=False); for
@@ -750,12 +948,18 @@ def run_random_single(
                     "selected_index": int(selected_index),
                     "selected_ld50_standardised": selected_ld50_standardised,
                     "selected_ld50_raw": selected_ld50_raw,
+                    "initial_best_ld50": initial_best_ld50,
                     "best_ld50_before": best_ld50_before,
                     "best_ld50_after": best_ld50_after,
+                    "improved_best": bool(
+                        best_ld50_after != best_ld50_before
+                    ),
                     "selected_mu": np.nan,
                     "selected_sigma": np.nan,
                     "selected_ucb": np.nan,
                     "selected_ucb_rank": np.nan,
+                    "selected_ei": np.nan,
+                    "selected_ei_rank": np.nan,
                     "selected_true_ld50_rank": selected_true_ld50_rank,
                     "selected_is_true_top_10": selected_is_true_top_10,
                     "n_non_dominated": np.nan,
@@ -784,6 +988,10 @@ def run_random_single(
 
             pd.DataFrame(history).to_csv(out_dir / "bo_trace.csv", index=False)
             np.save(out_dir / "observed_indices.npy", np.array(observed_indices))
+
+        _assert_convergence_monotonic(
+            initial_best_ld50, history, args.objective, seed, selection
+        )
 
         mlflow.log_artifact(str(out_dir / "bo_trace.csv"))
 
@@ -906,6 +1114,19 @@ def run_bo(args):
                 pca=pca,
             )
 
+        if "ucb" in strategies and "pareto" in strategies:
+            ucb_initial_best = float(
+                results[(seed, "ucb")]["initial_best_ld50"].iloc[0]
+            )
+            pareto_initial_best = float(
+                results[(seed, "pareto")]["initial_best_ld50"].iloc[0]
+            )
+            assert np.isclose(ucb_initial_best, pareto_initial_best), (
+                f"seed {seed}: UCB initial_best_ld50 ({ucb_initial_best}) != "
+                f"Pareto initial_best_ld50 ({pareto_initial_best}) despite "
+                "sharing the same initial_indices"
+            )
+
         if args.run_random:
             random_out_dir = seed_dir / "random"
 
@@ -927,7 +1148,16 @@ def build_parser():
     parser.add_argument("--out-dir", default="bo/results")
 
     parser.add_argument("--n-initial", type=int, default=100)
-    parser.add_argument("--n-iterations", type=int, default=20)
+    parser.add_argument(
+        "--n-iterations",
+        type=int,
+        default=300,
+        help=(
+            "Number of acquisition iterations to run (batch size 1). "
+            "Automatically capped at (pool size - n-initial), i.e. the "
+            "number of molecules not already in the initial sample."
+        ),
+    )
 
     parser.add_argument("--kappa", type=float, default=1.96)
     parser.add_argument(
@@ -965,14 +1195,15 @@ def build_parser():
 
     parser.add_argument(
         "--selection",
-        choices=["pareto", "ucb"],
+        choices=["pareto", "ucb", "ei"],
         nargs="+",
         default=["ucb", "pareto"],
         help=(
             "pareto: ParetoSelector utopia distance. ucb: argmax UCB. "
-            "Both run by default, from the same initial sample per seed, "
-            "for a paired comparison. Pass one value to run only that "
-            "strategy."
+            "ei: argmax Expected Improvement. ucb and pareto run by "
+            "default, from the same initial sample per seed, for a paired "
+            "comparison. Pass one or more values (e.g. '--selection ei') "
+            "to run a different subset of strategies."
         ),
     )
 
