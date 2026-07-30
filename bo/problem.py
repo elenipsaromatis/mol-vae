@@ -18,8 +18,9 @@ from model import VAE
 @dataclass
 class BOProblem:
     X: np.ndarray              # VAE latent embeddings, shape: (n_molecules, latent_dim)
-    y: np.ndarray              # standardised LD50 labels, shape: (n_molecules,)
-    y_raw: np.ndarray          # raw LD50 labels, shape: (n_molecules,)
+    y: np.ndarray              # standardised LD50 labels as observed by BO, shape: (n_molecules,)
+    y_raw: np.ndarray          # raw LD50 labels as observed by BO, shape: (n_molecules,)
+    y_raw_true: np.ndarray     # ground-truth raw LD50 labels, never perturbed, shape: (n_molecules,)
     smiles: np.ndarray         # canonical SMILES, dtype object, shape: (n_molecules,)
     ld50_mean: float
     ld50_std: float
@@ -107,6 +108,7 @@ def load_bo_problem(
         X=X,
         y=y,
         y_raw=y_raw,
+        y_raw_true=y_raw.copy(),
         smiles=smiles,
         ld50_mean=ld50_mean,
         ld50_std=ld50_std,

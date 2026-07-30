@@ -38,6 +38,7 @@ from sklearn.preprocessing import StandardScaler
 from scipy.stats import norm, qmc
 
 from bo.problem import load_bo_problem
+from bo.noise import apply_relative_noise
 from bo.dashboard_artifacts import log_dashboard_general
 from paretodo.selection.selector import ParetoSelector
 
@@ -361,6 +362,7 @@ def log_iteration_artifacts(
             "SMILES": smiles[all_indices],
             "LD50_raw": problem.y_raw[all_indices],
             "LD50_standardised": problem.y[all_indices],
+            "LD50_true_raw": problem.y_raw_true[all_indices],
             "mu": mu[all_indices],
             "sigma": sigma[all_indices],
             "ucb": ucb[all_indices],
@@ -385,8 +387,10 @@ def log_iteration_artifacts(
         .astype(int)
     )
 
+    # Always derived from ground-truth LD50 (never the noisy observed
+    # value), so this stays meaningful under --noise-scale.
     all_predictions["true_ld50_rank"] = (
-        all_predictions["LD50_raw"]
+        all_predictions["LD50_true_raw"]
         .rank(method="min", ascending=False)
         .astype(int)
     )
@@ -560,9 +564,15 @@ def run_bo_single(
         initial_best_ld50 = float(
             np.max(problem.y_raw[initial_indices])
         )
+        initial_best_ld50_true = float(
+            np.max(problem.y_raw_true[initial_indices])
+        )
     else:
         initial_best_ld50 = float(
             np.min(problem.y_raw[initial_indices])
+        )
+        initial_best_ld50_true = float(
+            np.min(problem.y_raw_true[initial_indices])
         )
 
     # Never request more acquisitions than there are unobserved molecules
@@ -592,6 +602,7 @@ def run_bo_single(
                 "seed": seed,
                 "objective": args.objective,
                 "selection": selection,
+                "noise_scale": args.noise_scale,
                 "n_candidates": n_candidates,
                 "latent_dim": int(X_scaled.shape[1]),
                 "mode": args.mode,
@@ -687,6 +698,9 @@ def run_bo_single(
             selected_ld50_raw = float(
                 problem.y_raw[selected_index]
             )
+            selected_ld50_true_raw_value = float(
+                problem.y_raw_true[selected_index]
+            )
 
             if args.objective == "maximize":
                 best_ld50_before = float(
@@ -700,6 +714,12 @@ def run_bo_single(
                     f"best_ld50_after ({best_ld50_after}) < best_ld50_before "
                     f"({best_ld50_before}) for a maximisation objective"
                 )
+                best_ld50_true_before = float(
+                    np.max(problem.y_raw_true[observed_array])
+                )
+                best_ld50_true_after = float(
+                    max(best_ld50_true_before, selected_ld50_true_raw_value)
+                )
             else:
                 best_ld50_before = float(
                     np.min(problem.y_raw[observed_array])
@@ -711,6 +731,12 @@ def run_bo_single(
                     f"seed {seed} | {selection} | iteration {iteration}: "
                     f"best_ld50_after ({best_ld50_after}) > best_ld50_before "
                     f"({best_ld50_before}) for a minimisation objective"
+                )
+                best_ld50_true_before = float(
+                    np.min(problem.y_raw_true[observed_array])
+                )
+                best_ld50_true_after = float(
+                    min(best_ld50_true_before, selected_ld50_true_raw_value)
                 )
 
             history.append(
@@ -724,9 +750,13 @@ def run_bo_single(
                     "selected_index": int(selected_index),
                     "selected_ld50_standardised": float(problem.y[selected_index]),
                     "selected_ld50_raw": selected_ld50_raw,
+                    "selected_ld50_true_raw": selected_ld50_true_raw_value,
                     "initial_best_ld50": initial_best_ld50,
+                    "initial_best_ld50_true": initial_best_ld50_true,
                     "best_ld50_before": best_ld50_before,
                     "best_ld50_after": best_ld50_after,
+                    "best_ld50_true_before": best_ld50_true_before,
+                    "best_ld50_true_after": best_ld50_true_after,
                     "improved_best": bool(
                         best_ld50_after != best_ld50_before
                     ),
@@ -745,12 +775,12 @@ def run_bo_single(
                         .iloc[selected_index]
                     ),
                     "selected_true_ld50_rank": int(
-                        pd.Series(problem.y_raw)
+                        pd.Series(problem.y_raw_true)
                         .rank(method="min", ascending=False)
                         .iloc[selected_index]
                     ),
                     "selected_is_true_top_10": bool(
-                        pd.Series(problem.y_raw)
+                        pd.Series(problem.y_raw_true)
                         .rank(method="min", ascending=False)
                         .iloc[selected_index] <= 10
                     ),
@@ -831,9 +861,15 @@ def run_random_single(
         initial_best_ld50 = float(
             np.max(problem.y_raw[initial_indices])
         )
+        initial_best_ld50_true = float(
+            np.max(problem.y_raw_true[initial_indices])
+        )
     else:
         initial_best_ld50 = float(
             np.min(problem.y_raw[initial_indices])
+        )
+        initial_best_ld50_true = float(
+            np.min(problem.y_raw_true[initial_indices])
         )
 
     # Never request more acquisitions than there are unobserved molecules
@@ -865,6 +901,7 @@ def run_random_single(
                 "objective": args.objective,
                 "selection": selection,
                 "representation": representation,
+                "noise_scale": args.noise_scale,
                 "n_candidates": n_candidates,
                 "mode": args.mode,
                 "initial_sample_size": n_initial,
@@ -899,6 +936,9 @@ def run_random_single(
 
             selected_ld50_raw = float(problem.y_raw[selected_index])
             selected_ld50_standardised = float(problem.y[selected_index])
+            selected_ld50_true_raw_value = float(
+                problem.y_raw_true[selected_index]
+            )
 
             if args.objective == "maximize":
                 best_ld50_before = float(
@@ -912,6 +952,12 @@ def run_random_single(
                     f"best_ld50_after ({best_ld50_after}) < best_ld50_before "
                     f"({best_ld50_before}) for a maximisation objective"
                 )
+                best_ld50_true_before = float(
+                    np.max(problem.y_raw_true[observed_array])
+                )
+                best_ld50_true_after = float(
+                    max(best_ld50_true_before, selected_ld50_true_raw_value)
+                )
             else:
                 best_ld50_before = float(
                     np.min(problem.y_raw[observed_array])
@@ -924,13 +970,20 @@ def run_random_single(
                     f"best_ld50_after ({best_ld50_after}) > best_ld50_before "
                     f"({best_ld50_before}) for a minimisation objective"
                 )
+                best_ld50_true_before = float(
+                    np.min(problem.y_raw_true[observed_array])
+                )
+                best_ld50_true_after = float(
+                    min(best_ld50_true_before, selected_ld50_true_raw_value)
+                )
 
             # True LD50 rank/top-10 respect the objective direction: for
             # "maximize" a larger LD50 ranks higher (ascending=False); for
-            # "minimize" a smaller LD50 ranks higher (ascending=True).
+            # "minimize" a smaller LD50 ranks higher (ascending=True). Always
+            # derived from ground-truth LD50, never the noisy observed value.
             rank_ascending = args.objective == "minimize"
             selected_true_ld50_rank = int(
-                pd.Series(problem.y_raw)
+                pd.Series(problem.y_raw_true)
                 .rank(method="min", ascending=rank_ascending)
                 .iloc[selected_index]
             )
@@ -948,9 +1001,13 @@ def run_random_single(
                     "selected_index": int(selected_index),
                     "selected_ld50_standardised": selected_ld50_standardised,
                     "selected_ld50_raw": selected_ld50_raw,
+                    "selected_ld50_true_raw": selected_ld50_true_raw_value,
                     "initial_best_ld50": initial_best_ld50,
+                    "initial_best_ld50_true": initial_best_ld50_true,
                     "best_ld50_before": best_ld50_before,
                     "best_ld50_after": best_ld50_after,
+                    "best_ld50_true_before": best_ld50_true_before,
+                    "best_ld50_true_after": best_ld50_true_after,
                     "improved_best": bool(
                         best_ld50_after != best_ld50_before
                     ),
@@ -1023,6 +1080,8 @@ def run_bo(args):
         device=args.device,
         ld50_col=args.ld50_col,
     )
+
+    problem = apply_relative_noise(problem, scale=args.noise_scale)
 
     if args.seed is not None and args.seeds is not None:
         raise ValueError(
@@ -1186,6 +1245,20 @@ def build_parser():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--device", default=None)
     parser.add_argument("--ld50-col", type=int, default=1)
+
+    parser.add_argument(
+        "--noise-scale",
+        type=float,
+        default=0.0,
+        help=(
+            "Relative Gaussian noise scale applied to LD50 before BO ever "
+            "sees it: LD50_noisy = LD50_true * (1 + epsilon), "
+            "epsilon ~ N(0, noise_scale^2). One fixed noise vector is drawn "
+            "per run (seeded at SEED_RUN + 1 = 101 from bo/noise.py), "
+            "identical across every --seeds value. Default 0.0 is the "
+            "noise-free baseline (no-op)."
+        ),
+    )
 
     parser.add_argument(
         "--objective",
