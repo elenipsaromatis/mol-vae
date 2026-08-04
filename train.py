@@ -222,6 +222,28 @@ def train():
             prop_hidden_size=PROP_HIDDEN_SIZE,
         ).to(device)
 
+        vae_config = {
+            "vocab_size": vocab_size,
+            "seq_len": MAX_LENGTH,
+            "hidden_dim": HIDDEN_DIM,
+            "latent_dim": LATENT_DIM,
+            "n_layers": N_LAYERS,
+            "dropout": DROPOUT,
+            "prop_hidden_size": PROP_HIDDEN_SIZE,
+        }
+        print(f"VAE config passed to constructor: {vae_config}")
+        print(model)
+        print(f"Decoder GRU num_layers (instantiated): {model.decoder.gru.num_layers}")
+        print(f"Decoder GRU dropout (instantiated): {model.decoder.gru.dropout}")
+        reg_dropout_ps = [
+            m.p for m in model.reg_predictor.net if isinstance(m, nn.Dropout)
+        ]
+        ld50_dropout_ps = [
+            m.p for m in model.ld50_predictor.net if isinstance(m, nn.Dropout)
+        ]
+        print(f"reg_predictor Dropout p (instantiated): {reg_dropout_ps}")
+        print(f"ld50_predictor Dropout p (instantiated): {ld50_dropout_ps}")
+
         def build_checkpoint():
             return {
                 "state_dict": model.state_dict(),

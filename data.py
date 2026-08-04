@@ -74,6 +74,9 @@ def _clean_property_dataframe(df, label_name):
     cleaned["Drug"] = cleaned["Drug"].apply(keep_largest_fragment)
     cleaned["Drug"] = cleaned["Drug"].apply(canonicalize_smiles)
     cleaned["Y"] = pd.to_numeric(cleaned["Y"], errors="coerce")
+    # Zhu LD50 values are in log10(mol/kg) units, but we want to work with mol/kg
+    if label_name == "Y_ld50":
+        cleaned["Y"] = 1 / (10 ** cleaned["Y"])
 
     cleaned.dropna(subset=["Drug", "Y"], inplace=True)
     cleaned = cleaned[cleaned["Drug"].str.len() <= MAX_LENGTH - 2]
@@ -268,3 +271,12 @@ def build_dataloaders_multitask(batch_size=64):
         ld50_mean,
         ld50_std,
     )
+
+
+def build_ld50_full_dataframe():
+    """Full LD50_Zhu, cleaned the same way as the overlap pipeline but not
+    merged against Solubility_AqSolDB. Used to test how well a VAE trained
+    on the solubility x LD50 overlap extrapolates to the rest of LD50_Zhu.
+    """
+    ld50_df = _get_tdc_dataframe(Tox(name="LD50_Zhu"))
+    return _clean_property_dataframe(ld50_df, "Y_ld50")

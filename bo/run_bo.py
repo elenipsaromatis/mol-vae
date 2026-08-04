@@ -37,7 +37,7 @@ from sklearn.gaussian_process.kernels import Matern, WhiteKernel
 from sklearn.preprocessing import StandardScaler
 from scipy.stats import norm, qmc
 
-from bo.problem import load_bo_problem
+from bo.problem import load_bo_problem, load_bo_problem_full_ld50
 from bo.noise import apply_relative_noise
 from bo.dashboard_artifacts import log_dashboard_general
 from paretodo.selection.selector import ParetoSelector
@@ -1074,12 +1074,19 @@ def run_bo(args):
     base_out_dir = Path(args.out_dir)
     base_out_dir.mkdir(parents=True, exist_ok=True)
 
-    problem = load_bo_problem(
-        checkpoint_path=args.checkpoint,
-        batch_size=args.batch_size,
-        device=args.device,
-        ld50_col=args.ld50_col,
-    )
+    if args.pool == "full-ld50":
+        problem = load_bo_problem_full_ld50(
+            checkpoint_path=args.checkpoint,
+            batch_size=args.batch_size,
+            device=args.device,
+        )
+    else:
+        problem = load_bo_problem(
+            checkpoint_path=args.checkpoint,
+            batch_size=args.batch_size,
+            device=args.device,
+            ld50_col=args.ld50_col,
+        )
 
     problem = apply_relative_noise(problem, scale=args.noise_scale)
 
@@ -1245,6 +1252,18 @@ def build_parser():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--device", default=None)
     parser.add_argument("--ld50-col", type=int, default=1)
+    parser.add_argument(
+        "--pool",
+        choices=["overlap", "full-ld50"],
+        default="overlap",
+        help=(
+            "overlap: candidate pool is the solubility x LD50 overlap the "
+            "VAE was trained on (default, unchanged behaviour). full-ld50: "
+            "candidate pool is the full LD50_Zhu dataset, encoded with the "
+            "same frozen checkpoint, to test how well the overlap-trained "
+            "latent space extrapolates. --ld50-col is ignored in this mode."
+        ),
+    )
 
     parser.add_argument(
         "--noise-scale",
