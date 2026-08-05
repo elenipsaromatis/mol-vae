@@ -74,9 +74,6 @@ def _clean_property_dataframe(df, label_name):
     cleaned["Drug"] = cleaned["Drug"].apply(keep_largest_fragment)
     cleaned["Drug"] = cleaned["Drug"].apply(canonicalize_smiles)
     cleaned["Y"] = pd.to_numeric(cleaned["Y"], errors="coerce")
-    # Zhu LD50 values are in log10(mol/kg) units, but we want to work with mol/kg
-    if label_name == "Y_ld50":
-        cleaned["Y"] = 1 / (10 ** cleaned["Y"])
 
     cleaned.dropna(subset=["Drug", "Y"], inplace=True)
     cleaned = cleaned[cleaned["Drug"].str.len() <= MAX_LENGTH - 2]
