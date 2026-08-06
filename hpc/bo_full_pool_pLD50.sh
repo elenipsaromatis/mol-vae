@@ -27,12 +27,18 @@
 # this SAME script, just restrict to the seeds still missing under
 # bo/results_pLD50/full_ld50_comparison/ (results merge into the same
 # out-dir; already-finished seeds are left untouched):
-#   qsub -l walltime=18:00:00 -v CHECKPOINT=checkpoints/vae_solubility_XXXXXXXX_best.pth,SEEDS="66 77 88" hpc/bo_full_pool_pLD50.sh
+#   qsub -l walltime=18:00:00 -v CHECKPOINT=checkpoints/vae_solubility_XXXXXXXX_best.pth,SEEDS=66+77+88 hpc/bo_full_pool_pLD50.sh
+#
+# SEEDS uses "+" as the separator (e.g. "66+77+88"), not spaces -- this
+# cluster's qsub mangles -v values containing whitespace regardless of
+# shell quoting. Converted back to space-separated below before being
+# passed to run_bo.py's --seeds (nargs="+").
 
 set -euo pipefail
 
 : "${CHECKPOINT:?Set CHECKPOINT via: qsub -v CHECKPOINT=checkpoints/vae_solubility_XXXXXXXX_best.pth hpc/bo_full_pool_pLD50.sh}"
 SEEDS="${SEEDS:-}"
+SEEDS="${SEEDS//+/ }"
 
 module purge
 module load miniforge/3
