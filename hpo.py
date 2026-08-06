@@ -10,7 +10,7 @@ import torch
 from data import MAX_LENGTH, build_dataloaders_multitask
 from evaluate import evaluate_regression
 from model import VAE
-from train import evaluate_loss, vae_loss
+from train_vae import evaluate_loss, vae_loss
 
 
 from optuna.storages import JournalStorage
@@ -176,7 +176,7 @@ def make_objective(
                         mu,
                         log_var,
                         reg_pred,
-                        ld50_pred,
+                        _ld50_pred,
                     ) = model(batch)
 
                     (
@@ -184,14 +184,12 @@ def make_objective(
                         recon_loss,
                         kl_loss,
                         reg_loss,
-                        ld50_loss,
                     ) = vae_loss(
                         logits=logits,
                         targets=batch[:, 1:],
                         mu=mu,
                         log_var=log_var,
                         reg_pred=reg_pred,
-                        ld50_pred=ld50_pred,
                         labels=labels,
                         beta=beta,
                         gamma=gamma,
@@ -214,7 +212,6 @@ def make_objective(
                     valid_recon,
                     valid_kl,
                     valid_reg_loss,
-                    valid_ld50_loss,
                 ) = evaluate_loss(
                     model=model,
                     loader=valid_loader,
@@ -236,19 +233,11 @@ def make_objective(
                 valid_rmse = valid_reg_metrics["rmse"]
                 valid_mae = valid_reg_metrics["mae"]
 
-                valid_ld50_metrics = evaluate_regression(
-                    model,
-                    valid_loader,
-                    device,
-                    ld50_mean,
-                    ld50_std,
-                    head="ld50_predictor",
-                    label_idx=1,
-                )
-                valid_ld50_rmse = valid_ld50_metrics["rmse"]
-                valid_ld50_mae = valid_ld50_metrics["mae"]
-
-                val_score = valid_recon + valid_reg_loss + valid_ld50_loss
+                # LD50 head is not a training target here (train_vae.py leaves
+                # it untrained; BO fits a GP on LD50 over latent z instead),
+                # so it is intentionally excluded from val_score and from
+                # per-epoch metrics — those numbers would be meaningless.
+                val_score = valid_recon + valid_reg_loss
 
                 mlflow.log_metrics(
                     {
@@ -256,11 +245,8 @@ def make_objective(
                         "valid_recon": valid_recon,
                         "valid_kl": valid_kl,
                         "valid_reg_loss": valid_reg_loss,
-                        "valid_ld50_loss": valid_ld50_loss,
                         "valid_rmse": valid_rmse,
                         "valid_mae": valid_mae,
-                        "valid_ld50_rmse": valid_ld50_rmse,
-                        "valid_ld50_mae": valid_ld50_mae,
                         "val_score": val_score,
                         "beta": beta,
                         "learning_rate": optimizer.param_groups[0]["lr"],
