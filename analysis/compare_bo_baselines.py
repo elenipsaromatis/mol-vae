@@ -198,16 +198,26 @@ def summarize_across_seeds(
 
 
 def build_first_found_series(
-    combined: pd.DataFrame, target: float, atol: float = 1e-6
+    combined: pd.DataFrame,
+    target: float,
+    atol: float = 1e-6,
+    objective: str = "maximize",
 ) -> pd.DataFrame:
     """Per (method, seed): the first evaluation at which the running-best
-    LD50 reaches `target` (within `atol`), or np.inf if never reached."""
+    LD50 reaches `target` (within `atol`), or np.inf if never reached.
+
+    "Reaches" means >= target for maximize (values climb toward the
+    target) and <= target for minimize (values fall toward it).
+    """
     series = build_convergence_series(combined)
     rows = []
 
     for (method, seed), group in series.groupby(["method", "seed"]):
         group = group.sort_values("evaluation")
-        found = group.loc[group["best_ld50"] >= target - atol, "evaluation"]
+        if objective == "minimize":
+            found = group.loc[group["best_ld50"] <= target + atol, "evaluation"]
+        else:
+            found = group.loc[group["best_ld50"] >= target - atol, "evaluation"]
         first_evaluation = float(found.iloc[0]) if not found.empty else np.inf
         rows.append(
             {"method": method, "seed": seed, "first_evaluation": first_evaluation}
@@ -262,17 +272,24 @@ def plot_mean_convergence(combined: pd.DataFrame, figures_dir: Path) -> Path:
 
 
 def plot_fraction_found_top(
-    combined: pd.DataFrame, figures_dir: Path, atol: float = 1e-6
+    combined: pd.DataFrame,
+    figures_dir: Path,
+    atol: float = 1e-6,
+    objective: str = "maximize",
 ) -> Path:
     """Cumulative fraction of seeds (per method) that have discovered the
     globally best-observed LD50 molecule by each iteration.
 
     Explains step-jumps in the mean/median convergence plots: a jump there
     happens exactly when one seed's curve here crosses from "not found" to
-    "found".
+    "found". "Best" is the max of best_ld50_after for maximize, the min
+    for minimize.
     """
-    target = float(combined["best_ld50_after"].max())
-    first_found = build_first_found_series(combined, target, atol=atol)
+    if objective == "minimize":
+        target = float(combined["best_ld50_after"].min())
+    else:
+        target = float(combined["best_ld50_after"].max())
+    first_found = build_first_found_series(combined, target, atol=atol, objective=objective)
     max_evaluation = int(combined["evaluation"].max())
 
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -463,7 +480,9 @@ def plot_mean_selected_by_iteration(combined: pd.DataFrame, figures_dir: Path) -
 
 
 
-def build_per_seed_summary(combined: pd.DataFrame) -> pd.DataFrame:
+def build_per_seed_summary(
+    combined: pd.DataFrame, objective: str = "maximize"
+) -> pd.DataFrame:
     records = []
 
     for (seed, method), group in combined.groupby(["seed", "method"]):
@@ -472,6 +491,12 @@ def build_per_seed_summary(combined: pd.DataFrame) -> pd.DataFrame:
         initial_best_ld50 = float(group["initial_best_ld50"].iloc[0])
         final_best_ld50 = float(group["best_ld50_after"].iloc[-1])
 
+        best_selected_ld50 = (
+            float(group["selected_ld50_raw"].min())
+            if objective == "minimize"
+            else float(group["selected_ld50_raw"].max())
+        )
+
         record = {
             "seed": seed,
             "method": method,
@@ -479,7 +504,7 @@ def build_per_seed_summary(combined: pd.DataFrame) -> pd.DataFrame:
             "initial_best_ld50": initial_best_ld50,
             "final_best_ld50": final_best_ld50,
             "improvement_over_initial": final_best_ld50 - initial_best_ld50,
-            "best_selected_ld50": float(group["selected_ld50_raw"].max()),
+            "best_selected_ld50": best_selected_ld50,
             "best_true_rank_selected": float(
                 group["selected_true_ld50_rank"].min()
             ),
@@ -652,6 +677,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="analysis/tables/bo_baseline_comparison",
         help="Directory to write comparison tables into.",
     )
+    parser.add_argument(
+        "--objective",
+        choices=["maximize", "minimize"],
+        default="maximize",
+        help=(
+            "Must match the --objective the results-dir was run with "
+            "(bo/run_bo.py's --objective). Controls which direction counts "
+            "as 'best' when finding the global-best molecule and each "
+            "seed's best selected LD50. Default 'maximize' preserves "
+            "behaviour for pre-existing (maximize-objective) results dirs."
+        ),
+    )
 
     return parser
 
@@ -683,7 +720,7 @@ def main() -> None:
 
     figure_paths = [
         plot_mean_convergence(combined, figures_dir),
-        plot_fraction_found_top(combined, figures_dir),
+        plot_fraction_found_top(combined, figures_dir, objective=args.objective),
         plot_final_best_by_method(combined, figures_dir),
         *[
             plot_topn_recovery(combined, figures_dir, n)
@@ -693,7 +730,7 @@ def main() -> None:
         plot_mean_selected_by_iteration(combined, figures_dir),
     ]
 
-    per_seed_summary = build_per_seed_summary(combined)
+    per_seed_summary = build_per_seed_summary(combined, objective=args.objective)
     per_seed_path = tables_dir / "per_seed_summary.csv"
     per_seed_summary.to_csv(per_seed_path, index=False)
 
