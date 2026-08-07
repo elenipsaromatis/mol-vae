@@ -774,14 +774,22 @@ def run_bo_single(
                         .rank(method="min", ascending=False)
                         .iloc[selected_index]
                     ),
+                    # True LD50 rank/top-10 respect the objective direction: for
+                    # "maximize" a larger LD50 ranks higher (ascending=False); for
+                    # "minimize" a smaller LD50 ranks higher (ascending=True). Always
+                    # derived from ground-truth LD50, never the noisy observed value.
+                    # (Matches the random-search loop's rank_ascending below --
+                    # this block used to hardcode ascending=False regardless of
+                    # args.objective, silently scoring "true top 10" against the
+                    # wrong tail for minimize runs.)
                     "selected_true_ld50_rank": int(
                         pd.Series(problem.y_raw_true)
-                        .rank(method="min", ascending=False)
+                        .rank(method="min", ascending=(args.objective == "minimize"))
                         .iloc[selected_index]
                     ),
                     "selected_is_true_top_10": bool(
                         pd.Series(problem.y_raw_true)
-                        .rank(method="min", ascending=False)
+                        .rank(method="min", ascending=(args.objective == "minimize"))
                         .iloc[selected_index] <= 10
                     ),
                     "n_non_dominated": int(len(pareto_indices)),
