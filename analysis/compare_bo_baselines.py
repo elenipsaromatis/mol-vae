@@ -1,12 +1,12 @@
-"""Multi-seed comparison of latent-space UCB BO, Pareto BO, EI BO, and
-random search.
+"""Multi-seed comparison of latent-space UCB BO, Pareto BO, Pareto-Expert BO,
+EI BO, and random search.
 
 Discovers `bo_trace.csv` files under
-`<results-dir>/seed_*/{ucb,pareto,ei,random}/`, combines them into one
-dataframe, and produces convergence/quality figures and per-seed/aggregate
-summary tables. All methods for a given seed share the exact same
-`initial_indices` (enforced by `bo/run_bo.py`), so the convergence curves
-are directly comparable from evaluation 0 onward.
+`<results-dir>/seed_*/{ucb,pareto,pareto_expert,ei,random}/`, combines them
+into one dataframe, and produces convergence/quality figures and
+per-seed/aggregate summary tables. All methods for a given seed share the
+exact same `initial_indices` (enforced by `bo/run_bo.py`), so the
+convergence curves are directly comparable from evaluation 0 onward.
 """
 
 from __future__ import annotations
@@ -23,13 +23,15 @@ import pandas as pd
 METHOD_DIR_TO_LABEL = {
     "ucb": "UCB",
     "pareto": "Pareto",
+    "pareto_expert": "Pareto-Expert",
     "ei": "EI",
     "random": "Random",
 }
-METHOD_ORDER = ["UCB", "Pareto", "EI", "Random"]
+METHOD_ORDER = ["UCB", "Pareto", "Pareto-Expert", "EI", "Random"]
 METHOD_COLORS = {
     "UCB": "tab:blue",
     "Pareto": "tab:orange",
+    "Pareto-Expert": "tab:red",
     "EI": "tab:purple",
     "Random": "tab:green",
 }
@@ -69,10 +71,11 @@ SEED_DIR_PATTERN = re.compile(r"seed_(\d+)")
 TIE_ATOL = 1e-9
 
 def find_trace_files(results_dir: Path) -> list[tuple[Path, int, str]]:
-    """Find every `seed_*/{ucb,pareto,random}/bo_trace.csv` under `results_dir`."""
+    """Find every `seed_*/{ucb,pareto,pareto_expert,ei,random}/bo_trace.csv`
+    under `results_dir`."""
     records: list[tuple[Path, int, str]] = []
 
-    for method_dir in ("ucb", "pareto", "ei", "random"):
+    for method_dir in ("ucb", "pareto", "pareto_expert", "ei", "random"):
         for path in sorted(results_dir.glob(f"seed_*/{method_dir}/bo_trace.csv")):
             seed_match = SEED_DIR_PATTERN.fullmatch(path.parent.parent.name)
             if seed_match is None:
@@ -105,7 +108,7 @@ def load_all_traces(results_dir: Path) -> pd.DataFrame:
     if not records:
         raise FileNotFoundError(
             "No bo_trace.csv files found under "
-            f"{results_dir}/seed_*/{{ucb,pareto,random}}/"
+            f"{results_dir}/seed_*/{{ucb,pareto,pareto_expert,ei,random}}/"
         )
 
     frames = [load_trace(path, seed, method_dir) for path, seed, method_dir in records]
@@ -657,15 +660,19 @@ def dataframe_to_markdown(df: pd.DataFrame) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare latent-space UCB BO, Pareto BO, and random search "
-            "across all seeds in a bo/run_bo.py results directory."
+            "Compare latent-space UCB BO, Pareto BO, Pareto-Expert BO, EI "
+            "BO, and random search across all seeds in a bo/run_bo.py "
+            "results directory."
         )
     )
 
     parser.add_argument(
         "--results-dir",
         default="bo/results/baseline_full",
-        help="Directory containing seed_*/{ucb,pareto,random}/bo_trace.csv",
+        help=(
+            "Directory containing "
+            "seed_*/{ucb,pareto,pareto_expert,ei,random}/bo_trace.csv"
+        ),
     )
     parser.add_argument(
         "--figures-dir",

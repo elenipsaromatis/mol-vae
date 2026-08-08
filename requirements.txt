@@ -13,4 +13,5 @@ pytest
 tensorboard
 botorch
 gpytorch
+polars
 -e ../pfgs-optimization

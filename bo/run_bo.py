@@ -4,12 +4,15 @@ Steps, per seed in RANDOM_SEEDS:
 1. Load VAE latent embeddings and LD50 labels (once).
 2. Fit a 3D PCA on the latent embeddings (once, shared by every seed/strategy).
 3. Latin Hypercube sample 100 initial molecules in that PCA space.
-4. For each selection strategy (UCB, Pareto, EI), starting from that same initial set:
+4. For each selection strategy (UCB, Pareto, EI, Pareto-Expert), starting from
+   that same initial set:
    a. Fit a GP on observed LD50 values.
    b. Predict mu and sigma for all molecules.
    c. Compute UCB and Expected Improvement.
    d. Keep non-dominated unobserved candidates.
-   e. Select the next candidate (UCB argmax, EI argmax, or ParetoSelector utopia distance).
+   e. Select the next candidate (UCB argmax, EI argmax, ParetoSelector utopia
+      distance, or -- for pareto_expert -- the front point with the best true
+      LD50, standing in for a human expert picking off the front).
    f. Add that selected candidate to the observed set.
    g. Repeat.
 
@@ -229,6 +232,33 @@ def select_via_pareto(candidate_indices, mu, sigma):
     )
 
     selected_index = int(selected_row["index"][0])
+
+    return selected_index, pareto_global_indices
+
+
+def select_via_pareto_expert(candidate_indices, mu, sigma, y_true, objective):
+    """Pick the front point a ground-truth-informed "expert" would choose.
+
+    Builds the exact same non-dominated front as `select_via_pareto` (same
+    GP mu/sigma, same domination rule), but instead of picking the point
+    closest to the utopia point, it looks up each front point's true LD50
+    (`y_true`, noiseless, never seen by the GP) and picks whichever one is
+    actually best. This is a stand-in for a human-in-the-loop expert who
+    could inspect the candidates on the front and just knows which one is
+    genuinely best, rather than a geometric proxy for that judgement.
+
+    Returns the selected global index and the non-dominated global indices,
+    matching `select_via_pareto`'s return shape.
+    """
+    pareto_global_indices = compute_pareto_indices(candidate_indices, mu, sigma)
+
+    front_true = y_true[pareto_global_indices]
+    if objective == "minimize":
+        best_local = int(np.argmin(front_true))
+    else:
+        best_local = int(np.argmax(front_true))
+
+    selected_index = int(pareto_global_indices[best_local])
 
     return selected_index, pareto_global_indices
 
@@ -674,6 +704,14 @@ def run_bo_single(
                 selected_index = select_via_ei(candidate_indices, ei)
                 pareto_indices = compute_pareto_indices(
                     candidate_indices, mu, sigma
+                )
+            elif selection == "pareto_expert":
+                selected_index, pareto_indices = select_via_pareto_expert(
+                    candidate_indices,
+                    mu,
+                    sigma,
+                    problem.y_raw_true,
+                    args.objective,
                 )
             else:
                 selected_index, pareto_indices = select_via_pareto(
@@ -1295,15 +1333,19 @@ def build_parser():
 
     parser.add_argument(
         "--selection",
-        choices=["pareto", "ucb", "ei"],
+        choices=["pareto", "ucb", "ei", "pareto_expert"],
         nargs="+",
         default=["ucb", "pareto"],
         help=(
             "pareto: ParetoSelector utopia distance. ucb: argmax UCB. "
-            "ei: argmax Expected Improvement. ucb and pareto run by "
-            "default, from the same initial sample per seed, for a paired "
-            "comparison. Pass one or more values (e.g. '--selection ei') "
-            "to run a different subset of strategies."
+            "ei: argmax Expected Improvement. pareto_expert: same "
+            "non-dominated front as pareto, but picks whichever front point "
+            "has the best true LD50 (ground truth, never seen by the GP) -- "
+            "a fake human-in-the-loop expert standing in for the utopia-"
+            "distance heuristic. ucb and pareto run by default, from the "
+            "same initial sample per seed, for a paired comparison. Pass "
+            "one or more values (e.g. '--selection ei pareto_expert') to "
+            "run a different subset of strategies."
         ),
     )
 
