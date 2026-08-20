@@ -119,7 +119,7 @@ mol-vae/
 └── logs/                     # Raw stdout logs from cluster sweeps (untracked)
 ```
 
-## Running things
+## Usage
 
 ```bash
 # Train the VAE
