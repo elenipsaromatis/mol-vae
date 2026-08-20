@@ -28,7 +28,7 @@ The BO objective is **pLD50** (`log(1/LD50)`, minimized) — see
 [`analysis/TRUE_analysis/README.md`](analysis/TRUE_analysis/README.md) for
 why, and for how that convention differs from earlier raw-LD50 experiments.
 
-## Dependency: `pfgs-optimization` (Sam Stricker)
+## Dependency: `pfgs-optimization`
 
 Pareto-front selection and the BO dashboard schema depend on
 **[`pfgs-optimization`](https://github.com/samstricker/pfgs-optimization)**
