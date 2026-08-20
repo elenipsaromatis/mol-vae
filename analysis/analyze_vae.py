@@ -13,6 +13,17 @@ import numpy as np
 import pandas as pd
 from mlflow.tracking import MlflowClient
 
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Charter", "Georgia", "DejaVu Serif"],
+    "axes.titlesize": 15,
+    "axes.labelsize": 14,
+    "xtick.labelsize": 13,
+    "ytick.labelsize": 13,
+    "legend.fontsize": 13,
+    "figure.titlesize": 18,
+})
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRACKING_DIR = ROOT / "notebooks" / "mlruns"
 DEFAULT_FIGURES_DIR = ROOT / "analysis" / "figures" / "final_vae"
@@ -107,6 +118,7 @@ def plot_metric_pair(
     valid_metric: str,
     title: str,
     ylabel: str,
+    show_legend: bool = True,
 ) -> None:
     plotted = False
     for metric_name, label in ((train_metric, "Train"), (valid_metric, "Validation")):
@@ -120,18 +132,22 @@ def plot_metric_pair(
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.3)
     if plotted:
-        ax.legend()
+        if show_legend:
+            ax.legend()
     else:
         ax.text(0.5, 0.5, "Metric history unavailable", ha="center", va="center", transform=ax.transAxes)
 
 
 def save_training_curves(history: pd.DataFrame, output_path: Path) -> None:
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
-    plot_metric_pair(axes[0, 0], history, "train_loss", "valid_loss", "Total loss", "Loss")
-    plot_metric_pair(axes[0, 1], history, "train_recon", "valid_recon", "Reconstruction loss", "Loss")
-    plot_metric_pair(axes[1, 0], history, "train_kl", "valid_kl", "KL divergence", "KL loss")
-    plot_metric_pair(axes[1, 1], history, "train_reg_loss", "valid_reg_loss", "Solubility regression loss", "Loss")
-    fig.suptitle("VAE Training History", y=1.02, fontsize=14)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    # Train/Validation legend only on the Total loss panel (top-left) -- it
+    # applies identically to all four panels, so showing it once avoids
+    # repeating the same legend four times.
+    plot_metric_pair(axes[0, 0], history, "train_loss", "valid_loss", "Total Loss", "Loss", show_legend=True)
+    plot_metric_pair(axes[0, 1], history, "train_recon", "valid_recon", "Reconstruction Loss", "Loss", show_legend=False)
+    plot_metric_pair(axes[1, 0], history, "train_kl", "valid_kl", "KL divergence", "KL Loss", show_legend=False)
+    plot_metric_pair(axes[1, 1], history, "train_reg_loss", "valid_reg_loss", "Solubility Regression Loss", "Loss", show_legend=False)
+    fig.suptitle("VAE Training History", y=1.02)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(output_path, dpi=300, bbox_inches="tight")

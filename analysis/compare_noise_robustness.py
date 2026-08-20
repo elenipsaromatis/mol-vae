@@ -1,14 +1,4 @@
 """LD50 noise-robustness comparison: noise-free vs. 10% vs. 20% relative noise.
-
-Loads `bo_trace.csv` files from three `bo/run_bo.py` results directories
-(one per noise level), and for each selection strategy plots the mean +/-
-std best-observed **true** LD50 (ground truth, not the noisy value BO
-optimized against) across seeds vs. BO iteration, with one curve per noise
-level.
-
-Trace files from before `--noise-scale` existed lack `best_ld50_true_after`
-/ `initial_best_ld50_true`; for those, true == observed (noise-free), so
-this script falls back to `best_ld50_after` / `initial_best_ld50`.
 """
 
 from __future__ import annotations

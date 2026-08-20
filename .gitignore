@@ -17,6 +17,7 @@ notebooks/mlruns/
 optuna_study.log
 best_params.json.temp/
 .temp/
+*.bak
 
 bo/results/seed_*/
 bo/results/seed_comparison/

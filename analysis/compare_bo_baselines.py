@@ -1,12 +1,5 @@
 """Multi-seed comparison of latent-space UCB BO, Pareto BO, Pareto-Expert BO,
 EI BO, and random search.
-
-Discovers `bo_trace.csv` files under
-`<results-dir>/seed_*/{ucb,pareto,pareto_expert,ei,random}/`, combines them
-into one dataframe, and produces convergence/quality figures and
-per-seed/aggregate summary tables. All methods for a given seed share the
-exact same `initial_indices` (enforced by `bo/run_bo.py`), so the
-convergence curves are directly comparable from evaluation 0 onward.
 """
 
 from __future__ import annotations
@@ -28,13 +21,7 @@ METHOD_DIR_TO_LABEL = {
     "random": "Random",
 }
 METHOD_ORDER = ["UCB", "Pareto", "Pareto-Expert", "EI", "Random"]
-METHOD_COLORS = {
-    "UCB": "tab:blue",
-    "Pareto": "tab:orange",
-    "Pareto-Expert": "tab:red",
-    "EI": "tab:purple",
-    "Random": "tab:green",
-}
+
 TOPN_RECOVERY_VALUES = [10, 20, 30, 50]
 
 REQUIRED_COLUMNS = [
@@ -70,12 +57,17 @@ SEED_DIR_PATTERN = re.compile(r"seed_(\d+)")
 
 TIE_ATOL = 1e-9
 
-def find_trace_files(results_dir: Path) -> list[tuple[Path, int, str]]:
-    """Find every `seed_*/{ucb,pareto,pareto_expert,ei,random}/bo_trace.csv`
-    under `results_dir`."""
+ALL_METHOD_DIRS = ("ucb", "pareto", "pareto_expert", "ei", "random")
+
+
+def find_trace_files(
+    results_dir: Path, method_dirs: tuple[str, ...] = ALL_METHOD_DIRS
+) -> list[tuple[Path, int, str]]:
+    """Find every `seed_*/<method_dir>/bo_trace.csv` under `results_dir`,
+    for each `method_dir` in `method_dirs` (default: all known strategies)."""
     records: list[tuple[Path, int, str]] = []
 
-    for method_dir in ("ucb", "pareto", "pareto_expert", "ei", "random"):
+    for method_dir in method_dirs:
         for path in sorted(results_dir.glob(f"seed_*/{method_dir}/bo_trace.csv")):
             seed_match = SEED_DIR_PATTERN.fullmatch(path.parent.parent.name)
             if seed_match is None:
@@ -102,13 +94,16 @@ def load_trace(path: Path, seed: int, method_dir: str) -> pd.DataFrame:
     return trace
 
 
-def load_all_traces(results_dir: Path) -> pd.DataFrame:
-    records = find_trace_files(results_dir)
+def load_all_traces(
+    results_dir: Path, exclude_methods: tuple[str, ...] = ()
+) -> pd.DataFrame:
+    method_dirs = tuple(m for m in ALL_METHOD_DIRS if m not in exclude_methods)
+    records = find_trace_files(results_dir, method_dirs=method_dirs)
 
     if not records:
         raise FileNotFoundError(
             "No bo_trace.csv files found under "
-            f"{results_dir}/seed_*/{{ucb,pareto,pareto_expert,ei,random}}/"
+            f"{results_dir}/seed_*/{{{','.join(method_dirs)}}}/"
         )
 
     frames = [load_trace(path, seed, method_dir) for path, seed, method_dir in records]
@@ -261,8 +256,7 @@ def plot_mean_convergence(combined: pd.DataFrame, figures_dir: Path) -> Path:
         )
 
     ax.set_xlabel("Iterations")
-    ax.set_ylabel("Best observed LD50")
-    ax.set_title("Bayesian Optimisation Convergence Across Seeds")
+    ax.set_ylabel("Best observed pLD50")
     ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
     ax.grid(True, alpha=0.25)
     ax.legend()
@@ -318,14 +312,24 @@ def plot_fraction_found_top(
             where="post",
             linewidth=2.0,
             label=f"{method} ({len(finite_evals)}/{total} seeds)",
-            color=METHOD_COLORS.get(method),
         )
 
     ax.set_xlabel("Iterations")
     ax.set_ylabel("Fraction of seeds that found it")
     ax.set_ylim(-0.05, 1.05)
-    ax.set_title(
-        f"Fraction of Seeds That Found the Global-Best Molecule (LD50={target:.3f})"
+    # Target value shown as a small in-axes annotation rather than a
+    # title, since the caption already states what this plot is; the
+    # exact target pLD50 is the one piece of per-dataset information not
+    # otherwise captured by the caption.
+    ax.text(
+        0.02,
+        0.98,
+        f"Target pLD50 = {target:.3f}",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.7, edgecolor="0.7"),
     )
     ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
     ax.grid(True, alpha=0.25)
@@ -370,8 +374,7 @@ def plot_final_best_by_method(combined: pd.DataFrame, figures_dir: Path) -> Path
         )
 
     ax.set_xlabel("Selection method")
-    ax.set_ylabel("Final best observed LD50")
-    ax.set_title("Final Optimisation Performance Across Seeds")
+    ax.set_ylabel("Final best observed pLD50")
     ax.grid(True, alpha=0.25, axis="y")
 
     output_path = figures_dir / "final_best_ld50_by_method.png"
@@ -406,7 +409,6 @@ def plot_topn_recovery(combined: pd.DataFrame, figures_dir: Path, n: int) -> Pat
 
     ax.set_xlabel("Iterations")
     ax.set_ylabel(f"Cumulative true top-{n} molecules found")
-    ax.set_title(f"True Top-{n} Ranked Molecules Discovered")
     ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
     ax.set_ylim(bottom=0)
     ax.grid(True, alpha=0.25)
@@ -430,8 +432,7 @@ def plot_selected_ld50_distribution(combined: pd.DataFrame, figures_dir: Path) -
     ax.boxplot(data, tick_labels=methods, showfliers=True)
 
     ax.set_xlabel("Selection method")
-    ax.set_ylabel("Selected molecule LD50")
-    ax.set_title("Distribution of selected molecule quality")
+    ax.set_ylabel("Selected molecule pLD50")
     ax.grid(True, alpha=0.25, axis="y")
 
     output_path = figures_dir / "selected_ld50_distribution.png"
@@ -469,8 +470,7 @@ def plot_mean_selected_by_iteration(combined: pd.DataFrame, figures_dir: Path) -
         )
 
     ax.set_xlabel("Iterations")
-    ax.set_ylabel("Mean selected LD50")
-    ax.set_title("Selected molecule quality during optimisation")
+    ax.set_ylabel("Mean selected pLD50")
     ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
     ax.grid(True, alpha=0.25)
     ax.legend()
@@ -538,7 +538,9 @@ def build_per_seed_summary(
     return per_seed
 
 
-def build_method_summary(per_seed: pd.DataFrame) -> pd.DataFrame:
+def build_method_summary(
+    per_seed: pd.DataFrame, objective: str = "maximize"
+) -> pd.DataFrame:
     random_finals = (
         per_seed.loc[per_seed["method"] == "Random"]
         .set_index("seed")["final_best_ld50"]
@@ -611,8 +613,11 @@ def build_method_summary(per_seed: pd.DataFrame) -> pd.DataFrame:
             else:
                 diff = matched["method_final"] - matched["random_final"]
                 tie_mask = np.isclose(diff, 0.0, atol=TIE_ATOL, rtol=0.0)
-                win_mask = (diff > 0) & ~tie_mask
-                loss_mask = (diff < 0) & ~tie_mask
+                # For "maximize" a higher final value than Random is a win;
+                # for "minimize" a lower final value than Random is a win.
+                beats_random = (diff < 0) if objective == "minimize" else (diff > 0)
+                win_mask = beats_random & ~tie_mask
+                loss_mask = ~beats_random & ~tie_mask
                 n_matched = len(matched)
 
                 record.update(
@@ -685,6 +690,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory to write comparison tables into.",
     )
     parser.add_argument(
+        "--exclude-methods",
+        choices=ALL_METHOD_DIRS,
+        nargs="+",
+        default=[],
+        help=(
+            "Selection strategy dirs to leave out of this comparison run "
+            "even if present under --results-dir, e.g. "
+            "'--exclude-methods pareto_expert' to compare only the "
+            "original ucb/pareto/ei/random quartet. Does not delete or "
+            "modify anything under --results-dir -- write to a different "
+            "--figures-dir/--tables-dir than a prior run over the same "
+            "results-dir if you want to keep both comparisons around."
+        ),
+    )
+    parser.add_argument(
         "--objective",
         choices=["maximize", "minimize"],
         default="maximize",
@@ -708,7 +728,9 @@ def main() -> None:
     tables_dir = Path(args.tables_dir)
 
     try:
-        combined = load_all_traces(results_dir)
+        combined = load_all_traces(
+            results_dir, exclude_methods=tuple(args.exclude_methods)
+        )
     except (FileNotFoundError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)
         raise SystemExit(1) from error
@@ -741,7 +763,7 @@ def main() -> None:
     per_seed_path = tables_dir / "per_seed_summary.csv"
     per_seed_summary.to_csv(per_seed_path, index=False)
 
-    method_summary = build_method_summary(per_seed_summary)
+    method_summary = build_method_summary(per_seed_summary, objective=args.objective)
     method_summary_path = tables_dir / "method_summary.csv"
     method_summary.to_csv(method_summary_path, index=False)
 

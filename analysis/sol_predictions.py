@@ -9,11 +9,21 @@ import numpy as np
 import pandas as pd
 import torch
 
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Charter", "Georgia", "DejaVu Serif"],
+    "axes.titlesize": 16,
+    "axes.labelsize": 14,
+    "xtick.labelsize": 13,
+    "ytick.labelsize": 13,
+    "legend.fontsize": 13,
+})
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from data import build_dataloaders_multitask  # noqa: E402
-from model import VAE  # noqa: E402
+from model import VAE  
 
 
 DEFAULT_CHECKPOINT = (
@@ -262,7 +272,8 @@ def save_prediction_plot(
     ax.set_ylabel("Predicted Solubility")
     ax.set_title("Predicted vs. True Solubility")
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    ax.tick_params(labelsize=13)
+    ax.legend(fontsize=13)
 
     metrics_text = (
         f"RMSE = {metrics['test_rmse']:.3f}\n"
@@ -276,6 +287,7 @@ def save_prediction_plot(
         transform=ax.transAxes,
         va="top",
         ha="left",
+        fontsize=13,
         bbox={
             "boxstyle": "round",
             "facecolor": "white",

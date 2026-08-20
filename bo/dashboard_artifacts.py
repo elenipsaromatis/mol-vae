@@ -9,11 +9,16 @@ folder, parsed by paretodo.data_models:
 The objective column names the dashboard expects are produced by
 OptimizationProblem.objective_labels, which uses Greek letters:
 
-- optimization_type "objective"          -> obj:max(mu(LD50))   [Greek mu]
+- optimization_type "objective"          -> obj:max(mu(LD50))    [Greek mu]
+                                             obj:min(mu(LD50)) for a
+                                             --objective minimize run
 - optimization_type "standard_deviation" -> obj:max(sigma(LD50)) [Greek sigma]
+                                             (always "max", regardless of
+                                             --objective)
 
-run_bo.py must write its pareto-front objective columns with those exact names,
-so keep OBJ_MU_COL / OBJ_SIGMA_COL there in sync with objective_labels here.
+run_bo.py must write its pareto-front objective columns with those exact
+names, so keep run_bo.py's _obj_mu_col()/OBJ_SIGMA_COL in sync with
+objective_labels here.
 """
 
 import json
@@ -49,17 +54,31 @@ def build_investigation_space_dict(X):
     return {"variables": variables}
 
 
-def build_optimization_problem_dict():
-    """Two maximised objectives on LD50: predictive mean and predictive std.
+def build_optimization_problem_dict(objective: str = "maximize"):
+    """Objective (mu) and predictive-std axes on LD50.
 
-    minimize=False gives the max( prefix. optimization_type controls the inner
-    symbol: objective -> mu, standard_deviation -> sigma.
+    minimize=False gives the max( prefix, minimize=True gives min(.
+    optimization_type controls the inner symbol: objective -> mu,
+    standard_deviation -> sigma.
+
+    The mu axis's direction must match run_bo.py's --objective: for a
+    "minimize" run, run_bo.py negates mu back to true (standardised) pLD50
+    units before logging it to the dashboard artifacts (see
+    log_iteration_artifacts's mu_display), so "lower is better" here is
+    genuinely consistent with the numbers on that axis -- flipping this flag
+    without that companion negation would make the label say the opposite of
+    what the plotted values mean.
+
+    The standard_deviation axis stays minimize=False regardless of
+    objective: GP posterior std doesn't change sign under the internal
+    y -> -y flip used for minimize runs, and it's always "more uncertainty"
+    on that axis, not a signed quantity to invert.
     """
     return {
         "problem": [
             {
                 "var_name": "LD50",
-                "minimize": False,
+                "minimize": objective == "minimize",
                 "optimization_type": "objective",
                 "lower_bound": None,
                 "upper_bound": None,
@@ -75,13 +94,14 @@ def build_optimization_problem_dict():
     }
 
 
-def log_dashboard_general(problem):
+def log_dashboard_general(problem, objective: str = "maximize"):
     """Write the two schema JSONs and log them under the run's general/ folder.
 
-    Call once inside an active MLflow run.
+    Call once inside an active MLflow run. `objective` must match the
+    --objective this run was started with (see build_optimization_problem_dict).
     """
     inv = build_investigation_space_dict(problem.X)
-    opt = build_optimization_problem_dict()
+    opt = build_optimization_problem_dict(objective)
 
     with tempfile.TemporaryDirectory() as tmp:
         inv_path = os.path.join(tmp, "investigation_space.json")

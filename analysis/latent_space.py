@@ -12,6 +12,17 @@ from sklearn.decomposition import PCA
 from torch.utils.data import DataLoader
 import plotly.express as px
 
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Charter", "Georgia", "DejaVu Serif"],
+    "axes.titlesize": 15,
+    "axes.labelsize": 13,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+    "legend.fontsize": 12,
+    "figure.titlesize": 17,
+})
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -273,7 +284,14 @@ def save_combined_plot(
     output_path: Path,
     explained_variance: np.ndarray,
 ) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Both colorbars use identical fraction/pad/aspect so they render at the
+    # exact same size regardless of the two properties' different value
+    # ranges/tick-label widths (the thesis PDF's version let the second
+    # colorbar auto-scale differently -- e.g. gaining "extend" arrow caps --
+    # which made the two panels visually mismatched).
+    colorbar_kwargs = dict(fraction=0.046, pad=0.04, aspect=20, extend="neither")
 
     sol_scatter = axes[0].scatter(
         frame["pc1"],
@@ -281,8 +299,8 @@ def save_combined_plot(
         c=frame["solubility"],
         alpha=0.75,
     )
-    sol_colorbar = fig.colorbar(sol_scatter, ax=axes[0])
-    sol_colorbar.set_label("Solubility")
+    sol_colorbar = fig.colorbar(sol_scatter, ax=axes[0], **colorbar_kwargs)
+    sol_colorbar.ax.tick_params(labelsize=12)
     axes[0].set_xlabel(
         f"Principal Component 1 "
         f"({explained_variance[0] * 100:.1f}%)"
@@ -291,7 +309,7 @@ def save_combined_plot(
         f"Principal Component 2 "
         f"({explained_variance[1] * 100:.1f}%)"
     )
-    axes[0].set_title("Latent Space Colored By Solubility")
+    axes[0].set_title("Latent Space Coloured By Solubility")
     axes[0].grid(True, alpha=0.25)
 
     ld50_scatter = axes[1].scatter(
@@ -300,8 +318,8 @@ def save_combined_plot(
         c=frame["ld50"],
         alpha=0.75,
     )
-    ld50_colorbar = fig.colorbar(ld50_scatter, ax=axes[1])
-    ld50_colorbar.set_label("LD50")
+    ld50_colorbar = fig.colorbar(ld50_scatter, ax=axes[1], **colorbar_kwargs)
+    ld50_colorbar.ax.tick_params(labelsize=12)
     axes[1].set_xlabel(
         f"Principal Component 1 "
         f"({explained_variance[0] * 100:.1f}%)"
@@ -310,10 +328,10 @@ def save_combined_plot(
         f"Principal Component 2 "
         f"({explained_variance[1] * 100:.1f}%)"
     )
-    axes[1].set_title("Latent Space Colored By LD50")
+    axes[1].set_title("Latent Space Coloured By pLD50")
     axes[1].grid(True, alpha=0.25)
 
-    fig.suptitle("Latent Space Property Comparison", fontsize=14)
+    fig.suptitle("Latent Space Property Comparison")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()

@@ -53,8 +53,19 @@ CHECKPOINT = Path("checkpoints/vae_solubility_70a6568a_best.pth")
 RANDOM_SEEDS = [11, 22, 33, 44, 55, 66, 77, 88, 99, 110]
 
 
-OBJ_MU_COL = "obj:max(\u03bc(LD50))"      # obj:max(mu(LD50))
-OBJ_SIGMA_COL = "obj:max(\u03c3(LD50))"   # obj:max(sigma(LD50))
+def _obj_mu_col(objective):
+    """Dashboard column/label for the mu axis, direction-matched to `objective`.
+
+    Must stay in sync with paretodo's OptimizationProblem.objective_labels
+    (see dashboard_artifacts.py) given the "minimize" flag
+    build_optimization_problem_dict(objective) produces.
+    """
+    prefix = "min" if objective == "minimize" else "max"
+    return f"obj:{prefix}(\u03bc(LD50))"
+
+
+OBJ_SIGMA_COL = "obj:max(\u03c3(LD50))"   # obj:max(sigma(LD50)) -- always "max", see
+                                           # build_optimization_problem_dict's docstring.
 
 
 def select_initial_indices_lhs_pca(pca_coords, n_initial, seed):
@@ -271,12 +282,18 @@ def plot_pareto_front(
     mu,
     sigma,
     save_path,
+    objective="maximize",
 ):
     """Scatter of the objective space for this iteration.
 
-    x = mu(LD50), y = sigma(LD50), both maximised, so the utopia corner is
-    top-right. Unobserved candidates are grey, the non-dominated front is
-    highlighted, and the selected point is starred.
+    x = mu(LD50) (direction per `objective`), y = sigma(LD50) (always
+    maximised), so the utopia corner is top-right for maximize runs and
+    bottom-right for minimize runs. Unobserved candidates are grey, the
+    non-dominated front is highlighted, and the selected point is starred.
+
+    `mu` here is expected to already be in display space (i.e. the caller
+    has negated it back to true-pLD50 units for minimize runs) -- see
+    log_iteration_artifacts's mu_display.
     """
     fig, ax = plt.subplots(figsize=(6, 5))
 
@@ -325,7 +342,8 @@ def plot_pareto_front(
         zorder=4,
     )
 
-    ax.set_xlabel("obj:max(mu(LD50))")
+    mu_prefix = "min" if objective == "minimize" else "max"
+    ax.set_xlabel(f"obj:{mu_prefix}(mu(LD50))")
     ax.set_ylabel("obj:max(sigma(LD50))")
     ax.set_title(f"Pareto front, iteration {iteration:02d}")
     ax.legend(loc="lower left", fontsize=8, framealpha=0.9)
@@ -347,10 +365,26 @@ def log_iteration_artifacts(
     ucb,
     ei,
     selection_method,
+    objective="maximize",
 ):
     """Write experiments/pareto front/selected recipes for this iteration
-    and log them into a dedicated MLflow artifact folder."""
+    and log them into a dedicated MLflow artifact folder.
+
+    `mu` is the GP posterior mean in *internal* (acquisition-function) space:
+    for a "minimize" run the GP was fit on -y, so mu here estimates -y, i.e.
+    higher mu is always better regardless of objective (that's what UCB/EI
+    argmax-based selection above relies on -- untouched by this function).
+
+    For the human-facing dashboard artifacts written below, we instead show
+    mu_display = -mu (minimize) or mu (maximize), which is an estimate of
+    the real (standardised) pLD50 value -- so "lower is better" on a
+    minimize run's dashboard axis actually matches the plotted numbers.
+    Selection/acquisition fields (ucb, ei) stay in internal space; only the
+    mu shown in the dashboard-facing tables/plot is converted.
+    """
     smiles = problem.smiles
+    mu_display = -mu if objective == "minimize" else mu
+    obj_mu_col = _obj_mu_col(objective)
 
     experiments = pd.DataFrame(
         {
@@ -364,7 +398,7 @@ def log_iteration_artifacts(
         {
             "RecipeID": pareto_indices,
             "SMILES": smiles[pareto_indices],
-            OBJ_MU_COL: mu[pareto_indices],
+            obj_mu_col: mu_display[pareto_indices],
             OBJ_SIGMA_COL: sigma[pareto_indices],
         }
     )
@@ -374,7 +408,7 @@ def log_iteration_artifacts(
             {
                 "RecipeID": int(selected_index),
                 "SMILES": str(smiles[selected_index]),
-                "mu": float(mu[selected_index]),
+                "mu": float(mu_display[selected_index]),
                 "sigma": float(sigma[selected_index]),
                 "ucb": float(ucb[selected_index]),
                 "ei": float(ei[selected_index]),
@@ -393,7 +427,7 @@ def log_iteration_artifacts(
             "LD50_raw": problem.y_raw[all_indices],
             "LD50_standardised": problem.y[all_indices],
             "LD50_true_raw": problem.y_raw_true[all_indices],
-            "mu": mu[all_indices],
+            "mu": mu_display[all_indices],
             "sigma": sigma[all_indices],
             "ucb": ucb[all_indices],
             "ei": ei[all_indices],
@@ -418,10 +452,16 @@ def log_iteration_artifacts(
     )
 
     # Always derived from ground-truth LD50 (never the noisy observed
-    # value), so this stays meaningful under --noise-scale.
+    # value), so this stays meaningful under --noise-scale. Direction must
+    # respect `objective`, same as history's selected_true_ld50_rank above:
+    # for "maximize" a larger true LD50 ranks higher (ascending=False), for
+    # "minimize" a smaller one does (ascending=True). This spot used to
+    # hardcode ascending=False regardless of objective, silently scoring
+    # every candidate's "true top 10" against the wrong tail for minimize
+    # runs (all_candidate_predictions.csv's is_true_top_10 column).
     all_predictions["true_ld50_rank"] = (
         all_predictions["LD50_true_raw"]
-        .rank(method="min", ascending=False)
+        .rank(method="min", ascending=(objective == "minimize"))
         .astype(int)
     )
 
@@ -453,9 +493,10 @@ def log_iteration_artifacts(
             candidate_indices=candidate_indices,
             pareto_indices=pareto_indices,
             selected_index=selected_index,
-            mu=mu,
+            mu=mu_display,
             sigma=sigma,
             save_path=plot_path,
+            objective=objective,
         )
 
         mlflow.log_artifact(exp_path, artifact_path=folder)
@@ -673,7 +714,7 @@ def run_bo_single(
             artifact_path="initial_sample",
         )
 
-        log_dashboard_general(problem)
+        log_dashboard_general(problem, args.objective)
 
         for iteration in range(n_run_iterations):
             observed_array = np.array(observed_indices, dtype=int)
@@ -731,6 +772,7 @@ def run_bo_single(
                 ucb=ucb,
                 ei=ei,
                 selection_method=selection,
+                objective=args.objective,
             )
 
             selected_ld50_raw = float(
