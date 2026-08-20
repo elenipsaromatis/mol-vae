@@ -85,7 +85,6 @@ mol-vae/
 ├── train_vae.py            # Trains the VAE (reconstruction + KL + solubility head) — produces checkpoints/
 ├── evaluate.py              # Reconstruction/generation evaluation utilities
 ├── hpo.py                  # Optuna hyperparameter search over VAE architecture/training config
-├── run_hpo.sh               # PBS job wrapper for hpo.py
 ├── requirements.txt
 │
 ├── data/                    # Cached raw property tables (AqSolDB, LD50_Zhu, CYP2C19/2D6)
@@ -114,6 +113,7 @@ mol-vae/
 │   └── TRUE_analysis/          # Canonical pLD50 (minimize) results — see its own README
 │
 ├── hpc/                      # PBS cluster job scripts (VAE training, BO sweeps, per objective/strategy)
+│   └── run_hpo.sh             # PBS job wrapper for hpo.py
 ├── notebooks/                 # Exploratory Jupyter notebooks
 ├── tests/                     # pytest unit tests for data/model/evaluate/hpo
 └── logs/                     # Raw stdout logs from cluster sweeps (untracked)
